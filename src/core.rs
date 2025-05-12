@@ -27,7 +27,7 @@ use argon2::{
 };
 use serde::{Serialize, Deserialize};
 use bincode::{serialize, deserialize, serialize_into, deserialize_from};
-use log::{info, warn, error, debug};
+use log::{info, warn, error, debug, trace};
 use num_cpus;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
@@ -36,6 +36,7 @@ const AES_NONCE_SIZE: usize = 12; // AES-GCM-SIV nonce size
 const SALT_SIZE: usize = 16; // Argon2 salt size
 const VERSION: u8 = 1;
 const LAST_CHECKED_INTERVAL: Duration = Duration::from_millis(10);
+const TIMEOUT_INTERVAL: Duration = Duration::from_millis(5);
 
 // File identifier for Locker AI files (64 bytes)
 const LOCKER_ID: [u8; 64] = [
@@ -50,7 +51,7 @@ static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug)]
 struct ShutdownState {
     shutdown: Arc<AtomicBool>,
-    error_message: Arc<Mutex<String>>,
+    error_message: Arc<Mutex<Vec<String>>>,
     last_checked: Instant,
 }
 
@@ -58,14 +59,14 @@ impl ShutdownState {
     fn new() -> Self {
         Self {
             shutdown: Arc::new(AtomicBool::new(false)),
-            error_message: Arc::new(Mutex::new(String::new())),
+            error_message: Arc::new(Mutex::new(Vec::new())),
             last_checked: Instant::now(),
         }
     }
     fn request_shutdown(&self, message: &str) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Ok(mut error_msg) = self.error_message.lock() {
-            *error_msg = format!("{}\n", message);
+            error_msg.push(message.to_string());
         }
     }
     fn is_shutdown(&self) -> bool {
@@ -73,7 +74,7 @@ impl ShutdownState {
     }
     fn get_error_message(&self) -> String {
         self.error_message.lock()
-            .map(|msg| msg.clone())
+            .map(|msgs| msgs.join(" "))
             .unwrap_or_else(|_| "Failed to get error message".to_string())
     }
     /// Checks if 10ms have elapsed since last check, and if so, checks shutdown flag and updates last_checked.
@@ -89,12 +90,14 @@ impl ShutdownState {
     }
 
     /// Catches a shutdown error and returns true if it should be shutdown, otherwise false.
-    fn catch_shutdown<T, E: std::fmt::Display>(&self, result: Result<T, E>) -> bool{
-        if let Err(e) = result {
-            self.request_shutdown(&format!("{}", e));
-            return true;
+    fn err_is_shutdown<T, E: std::fmt::Display>(&self, result: Result<T, E>) -> bool {
+        match result {
+            Ok(_) => false,
+            Err(e) => {
+                self.request_shutdown(&e.to_string());
+                true
+            }
         }
-        false
     }
 }
 
@@ -285,7 +288,7 @@ fn stream_encrypter(
         let data_receiver = data_receiver.clone();
         pool.spawn(move || {
             loop {
-                match data_receiver.recv_timeout(LAST_CHECKED_INTERVAL / 5) {
+                match data_receiver.recv_timeout(TIMEOUT_INTERVAL) {
                     Ok(chunk) => {
                         if let Some(_) = shutdown.should_shutdown() {
                             return;
@@ -338,10 +341,11 @@ fn stream_reorderer(
     ordered_sender: Sender<Vec<u8>>,
     mut shutdown: ShutdownState,
 ) -> io::Result<()> {
+    debug!("Starting reordering");
     let mut next_sequence = 0;
     let mut buffer = BTreeMap::new();
     loop {
-        match decrypted_receiver.recv_timeout(LAST_CHECKED_INTERVAL / 5) {
+        match decrypted_receiver.recv_timeout(TIMEOUT_INTERVAL) {
             Ok(chunk) => {
                 if let Some(msg) = shutdown.should_shutdown() {
                     return Err(io::Error::new(io::ErrorKind::Other, msg));
@@ -363,7 +367,9 @@ fn stream_reorderer(
                 }
                 continue;
             }
-            Err(_) => break,
+            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                break;
+            }
         }
     }
     Ok(())
@@ -375,7 +381,7 @@ fn stream_writer(
     mut shutdown: ShutdownState,
 ) -> io::Result<()> {
     loop {
-        match ordered_receiver.recv_timeout(LAST_CHECKED_INTERVAL / 5) {
+        match ordered_receiver.recv_timeout(TIMEOUT_INTERVAL) {
             Ok(chunk) => {
                 if let Some(msg) = shutdown.should_shutdown() {
                     return Err(io::Error::new(io::ErrorKind::Other, msg));
@@ -440,14 +446,14 @@ fn stream_decrypter(
         let encrypted_receiver = encrypted_receiver.clone();
         pool.spawn(move || {
             loop {
-                match encrypted_receiver.recv_timeout(LAST_CHECKED_INTERVAL / 5) {
+                match encrypted_receiver.recv_timeout(TIMEOUT_INTERVAL) {
                     Ok(chunk) => {
 
                         if let Some(_) = shutdown.should_shutdown() {
                             break;
                         }
 
-                        if shutdown.catch_shutdown ( 
+                        if shutdown.err_is_shutdown ( 
                             (|| {
                                 debug!("Decrypting chunk of size {}", chunk.len());
                                 let encrypted_chunk = match deserialize::<EncryptedChunk>(&chunk) {
@@ -499,17 +505,17 @@ fn stream_extractor(
     decrypted_receiver: Receiver<Vec<u8>>,
     mut shutdown: ShutdownState,
 ) -> io::Result<()> {
-    let temp_tar = output_path.with_extension("tar");
+    let file_name = output_path.iter().last().unwrap();
+    let temp_tar = "/tmp/".to_string() + file_name.to_str().unwrap();
     {
         let mut tar_file = File::create(&temp_tar)?;
         loop {
-            match decrypted_receiver.recv_timeout(LAST_CHECKED_INTERVAL / 5) {
+            match decrypted_receiver.recv_timeout(TIMEOUT_INTERVAL) {
                 Ok(chunk) => {
                     if let Some(msg) = shutdown.should_shutdown() {
                         return Err(io::Error::new(io::ErrorKind::Other, msg));
                     }
 
-                    debug!("Writing chunk to tar file {}", chunk.len());
                     tar_file.write_all(&chunk)?;
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
@@ -518,7 +524,9 @@ fn stream_extractor(
                     }
                     continue;
                 }
-                Err(_) => break,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
             }
         }
         tar_file.flush()?;
@@ -553,14 +561,13 @@ fn stream_extractor(
     Ok(())
 }
 
-pub fn encrypt_folder(folder_path: &Path, password: &str, algorithm: EncryptionAlgorithm) -> io::Result<()> {
-    info!("Starting encryption of {} using {}", folder_path.display(), algorithm.to_string());
+pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, algorithm: EncryptionAlgorithm) -> io::Result<()> {
+    info!("Starting encryption of {} to {} using {}", folder_path.display(), output_path.display(), algorithm.to_string());
     
     let shutdown = ShutdownState::new();
     
     // Create output file
-    let output_path = folder_path.with_extension("encrypted");
-    let mut output_file = File::create(&output_path)?;
+    let mut output_file = File::create(output_path)?;
     debug!("Created output file: {}", output_path.display());
 
     // Write Locker ID
@@ -597,16 +604,16 @@ pub fn encrypt_folder(folder_path: &Path, password: &str, algorithm: EncryptionA
     // Spawn threads
     let folder_path = folder_path.to_path_buf();
     let shutdown_clone = shutdown.clone();
-    let tar_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_tar(&folder_path, data_sender, shutdown_clone.clone())));
+    let tar_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_tar(&folder_path, data_sender, shutdown_clone.clone())));
     
     let shutdown_clone = shutdown.clone();
-    let encrypt_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_encrypter(data_receiver, encrypted_sender, encrypter, shutdown_clone.clone())));
+    let encrypt_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_encrypter(data_receiver, encrypted_sender, encrypter, shutdown_clone.clone())));
     
     let shutdown_clone = shutdown.clone();
-    let reorder_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_reorderer(encrypted_receiver, ordered_sender, shutdown_clone.clone())));
+    let reorder_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_reorderer(encrypted_receiver, ordered_sender, shutdown_clone.clone())));
 
     let shutdown_clone = shutdown.clone();
-    let write_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_writer(output_file, ordered_receiver, shutdown_clone.clone())));
+    let write_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_writer(output_file, ordered_receiver, shutdown_clone.clone())));
 
     // Wait for all threads to complete
     tar_thread.join().unwrap();
@@ -623,7 +630,7 @@ pub fn encrypt_folder(folder_path: &Path, password: &str, algorithm: EncryptionA
     Ok(())
 }
 
-pub fn decrypt_folder(encrypted_path: &Path, password: &str, output_path: &Path) -> io::Result<()> {
+pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str) -> io::Result<()> {
     info!("Starting decryption of {} to {}", encrypted_path.display(), output_path.display());
     
     let shutdown = ShutdownState::new();
@@ -668,16 +675,16 @@ pub fn decrypt_folder(encrypted_path: &Path, password: &str, output_path: &Path)
     // Spawn threads
     let output_path = output_path.to_path_buf();
     let shutdown_clone = shutdown.clone();
-    let read_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_reader(encrypted_file, encrypted_sender, shutdown_clone.clone())));
+    let read_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_reader(encrypted_file, encrypted_sender, shutdown_clone.clone())));
     
     let shutdown_clone = shutdown.clone();
-    let decrypt_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_decrypter(encrypted_receiver, decrypted_sender, decrypter, shutdown_clone.clone())));
+    let decrypt_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_decrypter(encrypted_receiver, decrypted_sender, decrypter, shutdown_clone.clone())));
     
     let shutdown_clone = shutdown.clone();
-    let reorder_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_reorderer(decrypted_receiver, ordered_sender, shutdown_clone.clone())));
+    let reorder_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_reorderer(decrypted_receiver, ordered_sender, shutdown_clone.clone())));
 
     let shutdown_clone = shutdown.clone();
-    let extract_thread = thread::spawn(move || shutdown_clone.catch_shutdown(stream_extractor(&output_path, ordered_receiver, shutdown_clone.clone())));
+    let extract_thread = thread::spawn(move || shutdown_clone.err_is_shutdown(stream_extractor(&output_path, ordered_receiver, shutdown_clone.clone())));
 
     // Wait for all threads to complete
     read_thread.join().unwrap();
@@ -911,7 +918,7 @@ mod tests {
         let (test_dir, decrypted_dir) = setup_test_files(structure);
         
         // Encrypt
-        encrypt_folder(&test_dir, "testpassword", algorithm)?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", algorithm)?;
 
         // Verify encrypted file
         let encrypted_file = test_dir.with_extension("encrypted");
@@ -919,7 +926,7 @@ mod tests {
         assert!(fs::metadata(&encrypted_file)?.len() > 0, "Encrypted file is empty");
 
         // Decrypt
-        decrypt_folder(&encrypted_file, "testpassword", &decrypted_dir)?;
+        decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword")?;
 
         // Verify decrypted files
         verify_decrypted_files(&decrypted_dir, structure);
@@ -995,11 +1002,11 @@ mod tests {
         let (test_dir, decrypted_dir) = setup_test_files("mixed");
         
         // Encrypt using ChaCha20Poly1305
-        encrypt_folder(&test_dir, "correct_password", EncryptionAlgorithm::ChaCha20Poly1305)?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "correct_password", EncryptionAlgorithm::ChaCha20Poly1305)?;
 
         // Try to decrypt with wrong password
         let encrypted_file = test_dir.with_extension("encrypted");
-        let result = decrypt_folder(&encrypted_file, "wrong_password", &decrypted_dir);
+        let result = decrypt_folder(&encrypted_file, &decrypted_dir, "wrong_password");
         assert!(result.is_err(), "Decryption with wrong password should fail");
 
         // Cleanup
@@ -1012,14 +1019,14 @@ mod tests {
         init_logger();
         let (test_dir, decrypted_dir) = setup_test_files("mixed");
         // Encrypt using AES-GCM-SIV
-        encrypt_folder(&test_dir, "testpassword", EncryptionAlgorithm::Aes256GcmSiv)?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", EncryptionAlgorithm::Aes256GcmSiv)?;
         // Corrupt the encrypted file
         let encrypted_file = test_dir.with_extension("encrypted");
         let mut content = fs::read(&encrypted_file)?;
         content[100] = content[100].wrapping_add(1); // Modify one byte
         fs::write(&encrypted_file, content)?;
         // Try to decrypt corrupted file
-        let result = decrypt_folder(&encrypted_file, "testpassword", &decrypted_dir);
+        let result = decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword");
         assert!(result.is_err(), "Decryption of corrupted file should fail");
         // Cleanup
         cleanup_test_files(&test_dir, &decrypted_dir);

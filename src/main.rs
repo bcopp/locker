@@ -1,9 +1,11 @@
 mod core;
-
+mod fusefs;
+use core::init_logger;
 use std::path::Path;
 use std::fs;
 
 fn main() -> std::io::Result<()> {
+    init_logger();
     // Create a test directory with some files
     let test_dir = Path::new("test_folder");
     fs::create_dir_all(test_dir.join("subdir"))?;
@@ -14,8 +16,14 @@ fn main() -> std::io::Result<()> {
 
     // Encrypt the folder
     println!("Encrypting folder...");
-    core::encrypt_folder(test_dir, "mysecretpassword", core::EncryptionAlgorithm::Aes256GcmSiv)?;
+    let output_path = Path::new("test_folder").with_extension("locker");
+    core::encrypt_folder(test_dir, &output_path, "mysecretpassword", core::EncryptionAlgorithm::Aes256GcmSiv)?;
     println!("Encryption complete!");
+
+    // Mount and decrypt the folder using FUSE
+    println!("Mounting and decrypting folder...");
+    fusefs::mount_and_decrypt(&output_path, "mysecretpassword")?;
+    println!("Mount and decrypt complete!");
 
     Ok(())
 }
