@@ -11,22 +11,15 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::iter;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::thread;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use fuser::MountOption;
+use std::time::{Duration, SystemTime};
 use fuser::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
 
-use log::{debug, error, info, trace};
+use log::{debug, info, trace};
 
-use crate::core::{decrypt_folder, LazyShutdown};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -199,7 +192,7 @@ impl MemFilesystem {
     /// Updates the attributes on an inode with values in `new_attrs`.
     fn setattr(&mut self, ino: u64, new_attrs: SetAttrRequest) -> Result<&FileAttr, Error> {
         debug!("setattr(ino={}, new_attrs={:?})", ino, new_attrs);
-        let mut file_attrs = self.attrs.get_mut(&ino).ok_or(Error::NoEntry)?;
+        let file_attrs = self.attrs.get_mut(&ino).ok_or(Error::NoEntry)?;
 
         // This should be first, so if we don't find the file don't update other attributes:
         match new_attrs.size {

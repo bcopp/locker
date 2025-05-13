@@ -1,6 +1,6 @@
 mod core;
 mod fusefs;
-use core::{init_logger, LazyShutdown, CTRL_C, sudo_keep_alive};
+use core::{init_logger, CTRL_C, sudo_keep_alive};
 use std::path::Path;
 use std::fs;
 

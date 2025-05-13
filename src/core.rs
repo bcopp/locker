@@ -1,34 +1,27 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::io::{self, Read, Write, Seek};
+use std::io::{self, Read, Write};
 use std::thread;
-use crossbeam::channel::{self, Sender, Receiver, SendError, SendTimeoutError};
+use crossbeam::channel::{self, Sender, Receiver};
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce, Error as ChaChaError
+    aead::{Aead, KeyInit, OsRng},
+    ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce
 };
 use aes_gcm_siv::{
-    aead::{Aead as AesAead, KeyInit as AesKeyInit, KeySizeUser},
-    Aes256GcmSiv, Key as AesKey, Nonce as AesNonce, Error as AesError
+    aead::{Aead as AesAead, KeyInit as AesKeyInit},
+    Aes256GcmSiv, Key as AesKey, Nonce as AesNonce
 };
 use tar::{Builder, Archive};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use argon2::{Argon2, Algorithm, Version, Params};
+use argon2::Argon2;
 use rand::Rng;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex, Once};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 use std::time::{Duration, Instant};
-use argon2::{
-    password_hash::{
-        rand_core::OsRng as ArgonOsRng,
-        PasswordHash as ArgonPasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    },
-    Argon2 as ArgonHasher, PasswordHash as ArgonHash,
-};
 use serde::{Serialize, Deserialize};
 use bincode::{serialize, deserialize, serialize_into, deserialize_from};
-use log::{info, warn, error, debug, trace};
+use log::{info, error, debug};
 use num_cpus;
 use std::process::Command;
 use fuser::{MountOption, Filesystem};
@@ -331,7 +324,7 @@ fn stream_encrypter(
     data_receiver: Receiver<Chunk>,
     encrypted_sender: Sender<Chunk>,
     encrypter: StreamEncrypter,
-    mut shutdown: LazyShutdown,
+    shutdown: LazyShutdown,
 ) -> io::Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(get_max_threads())
@@ -489,7 +482,7 @@ fn stream_decrypter(
     encrypted_receiver: Receiver<Vec<u8>>,
     decrypted_sender: Sender<Chunk>,
     decrypter: StreamDecrypter,
-    mut shutdown: LazyShutdown,
+    shutdown: LazyShutdown,
 ) -> io::Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(get_max_threads())
@@ -684,7 +677,7 @@ pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, al
     Ok(())
 }
 
-pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, mut shutdown: LazyShutdown) -> io::Result<()> {
+pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, shutdown: LazyShutdown) -> io::Result<()> {
     info!("Starting decryption of {} to {}", encrypted_path.display(), output_path.display());
     
     // Open encrypted file
