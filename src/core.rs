@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{self, Read, Write, Seek};
 use std::thread;
@@ -16,7 +17,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use argon2::{Argon2, Algorithm, Version, Params};
 use rand::Rng;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex, Once};
 use std::time::{Duration, Instant};
 use argon2::{
     password_hash::{
@@ -29,6 +30,11 @@ use serde::{Serialize, Deserialize};
 use bincode::{serialize, deserialize, serialize_into, deserialize_from};
 use log::{info, warn, error, debug, trace};
 use num_cpus;
+use std::process::Command;
+use fuser::{MountOption, Filesystem};
+use std::sync::LazyLock;
+use ctrlc;
+use whoami;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 const NONCE_SIZE: usize = 12; // ChaCha20Poly1305 nonce size
@@ -49,37 +55,38 @@ const LOCKER_ID: [u8; 64] = [
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
-struct ShutdownState {
+pub struct LazyShutdown {
     shutdown: Arc<AtomicBool>,
     error_message: Arc<Mutex<Vec<String>>>,
     last_checked: Instant,
 }
 
-impl ShutdownState {
-    fn new() -> Self {
+impl LazyShutdown {
+    pub fn new() -> Self {
         Self {
             shutdown: Arc::new(AtomicBool::new(false)),
             error_message: Arc::new(Mutex::new(Vec::new())),
             last_checked: Instant::now(),
         }
     }
-    fn request_shutdown(&self, message: &str) {
+
+    pub fn request_shutdown(&self, message: &str) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Ok(mut error_msg) = self.error_message.lock() {
             error_msg.push(message.to_string());
         }
     }
-    fn is_shutdown(&self) -> bool {
+
+    pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
     }
-    fn get_error_message(&self) -> String {
+
+    pub fn get_error_message(&self) -> String {
         self.error_message.lock()
             .map(|msgs| msgs.join(" "))
             .unwrap_or_else(|_| "Failed to get error message".to_string())
     }
-    /// Checks if 10ms have elapsed since last check, and if so, checks shutdown flag and updates last_checked.
-    /// Returns Some(error_message) if shutdown is set, otherwise None.
-    fn should_shutdown(&mut self) -> Option<String> {
+    pub fn should_shutdown(&mut self) -> Option<String> {
         if self.last_checked.elapsed() >= Duration::from_millis(10) {
             self.last_checked = Instant::now();
             if self.is_shutdown() {
@@ -88,9 +95,7 @@ impl ShutdownState {
         }
         None
     }
-
-    /// Catches a shutdown error and returns true if it should be shutdown, otherwise false.
-    fn err_is_shutdown<T, E: std::fmt::Display>(&self, result: Result<T, E>) -> bool {
+    pub fn err_is_shutdown<T, E: std::fmt::Display>(&self, result: Result<T, E>) -> bool {
         match result {
             Ok(_) => false,
             Err(e) => {
@@ -101,12 +106,63 @@ impl ShutdownState {
     }
 }
 
-impl Clone for ShutdownState {
+impl Clone for LazyShutdown {
     fn clone(&self) -> Self {
         Self {
             shutdown: Arc::clone(&self.shutdown),
             error_message: Arc::clone(&self.error_message),
             last_checked: Instant::now(),
+        }
+    }
+}
+
+pub struct CtrlC {
+    shutdown: LazyShutdown,
+    mount_path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl CtrlC {
+    fn new() -> Self {
+        Self {
+            shutdown: LazyShutdown::new(),
+            mount_path: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set_mount_path(&self, path: PathBuf) {
+        if let Ok(mut mount_path) = self.mount_path.lock() {
+            *mount_path = Some(path);
+        }
+    }
+
+    pub fn get_shutdown(&self) -> LazyShutdown {
+        self.shutdown.clone()
+    }
+
+    pub fn handle_ctrlc(&self) {
+        if let Ok(mount_path) = self.mount_path.lock() {
+            if let Some(path) = mount_path.as_ref() {
+                let _ = cleanup_mount(path);
+            }
+        }
+        self.shutdown.request_shutdown("Received Ctrl+C signal");
+    }
+}
+
+pub static CTRL_C: LazyLock<CtrlC> = LazyLock::new(|| {
+    let ctrlc = CtrlC::new();
+    let ctrlc_clone = ctrlc.clone();
+    ctrlc::set_handler(move || {
+        ctrlc_clone.handle_ctrlc();
+    }).expect("Error setting Ctrl-C handler");
+    ctrlc
+});
+
+impl Clone for CtrlC {
+    fn clone(&self) -> Self {
+        Self {
+            shutdown: self.shutdown.clone(),
+            mount_path: Arc::clone(&self.mount_path),
         }
     }
 }
@@ -251,7 +307,7 @@ fn get_max_threads() -> usize {
 fn stream_tar(
     folder_path: &Path,
     data_sender: Sender<Chunk>,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     debug!("Starting tar creation for {}", folder_path.display());
     let mut builder = Builder::new(Vec::new());
@@ -275,7 +331,7 @@ fn stream_encrypter(
     data_receiver: Receiver<Chunk>,
     encrypted_sender: Sender<Chunk>,
     encrypter: StreamEncrypter,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(get_max_threads())
@@ -339,7 +395,7 @@ fn stream_encrypter(
 fn stream_reorderer(
     decrypted_receiver: Receiver<Chunk>,
     ordered_sender: Sender<Vec<u8>>,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     debug!("Starting reordering");
     let mut next_sequence = 0;
@@ -378,7 +434,7 @@ fn stream_reorderer(
 fn stream_writer(
     mut output_file: File,
     ordered_receiver: Receiver<Vec<u8>>,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     loop {
         match ordered_receiver.recv_timeout(TIMEOUT_INTERVAL) {
@@ -405,7 +461,7 @@ fn stream_writer(
 fn stream_reader(
     mut encrypted_file: File,
     encrypted_sender: Sender<Vec<u8>>,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     let mut size_buffer = [0u8; 8];
     loop {
@@ -433,7 +489,7 @@ fn stream_decrypter(
     encrypted_receiver: Receiver<Vec<u8>>,
     decrypted_sender: Sender<Chunk>,
     decrypter: StreamDecrypter,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(get_max_threads())
@@ -503,7 +559,7 @@ fn stream_decrypter(
 fn stream_extractor(
     output_path: &Path,
     decrypted_receiver: Receiver<Vec<u8>>,
-    mut shutdown: ShutdownState,
+    mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
     let file_name = output_path.iter().last().unwrap();
     let temp_tar = "/tmp/".to_string() + file_name.to_str().unwrap();
@@ -561,10 +617,8 @@ fn stream_extractor(
     Ok(())
 }
 
-pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, algorithm: EncryptionAlgorithm) -> io::Result<()> {
+pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, algorithm: EncryptionAlgorithm, shutdown: LazyShutdown) -> io::Result<()> {
     info!("Starting encryption of {} to {} using {}", folder_path.display(), output_path.display(), algorithm.to_string());
-    
-    let shutdown = ShutdownState::new();
     
     // Create output file
     let mut output_file = File::create(output_path)?;
@@ -630,10 +684,8 @@ pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, al
     Ok(())
 }
 
-pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str) -> io::Result<()> {
+pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, mut shutdown: LazyShutdown) -> io::Result<()> {
     info!("Starting decryption of {} to {}", encrypted_path.display(), output_path.display());
-    
-    let shutdown = ShutdownState::new();
     
     // Open encrypted file
     let mut encrypted_file = File::open(encrypted_path)?;
@@ -802,6 +854,169 @@ fn decrypt_file(
     Ok(())
 }
 
+
+pub fn mount_and_decrypt(encrypted_path: &Path, password: &str) -> std::io::Result<()> {
+    let file_name = encrypted_path.file_name().unwrap().to_string_lossy();
+    let mount_path = Path::new("/media").join(file_name.as_ref());
+
+    // Set up Ctrl+C handler
+    CTRL_C.set_mount_path(mount_path.clone());
+
+    info!("Requesting sudo to mount file system at {}...", &mount_path.display());
+
+    Command::new("sudo").arg("-v").status()?;
+    Command::new("sudo").arg("mkdir").arg("-p").arg(&mount_path).status()?;
+    Command::new("sudo").arg("chown").arg(format!("{}:{}", whoami::username(), whoami::username())).arg(&mount_path).status()?;
+    Command::new("sudo").arg("chmod").arg("777").arg(&mount_path).status()?;
+
+    let shutdown = CTRL_C.get_shutdown();
+
+    let encrypted_path_clone = encrypted_path.to_path_buf();
+    let password_clone = password.to_string();
+    let shutdown_clone = shutdown.clone();
+    let mount_path_clone = mount_path.clone();
+    let decrypt_thread = std::thread::spawn(move || {
+        match is_mount(&mount_path_clone) {
+            Ok(()) => {
+                let _ = decrypt_folder(&encrypted_path_clone, &mount_path_clone, &password_clone, shutdown_clone.clone());
+            }
+            Err(e) => {
+                error!("Failed to mount and decrypt: {}", e);
+            }
+        }
+    });
+
+    // Mount and decrypt
+    let fs = crate::fusefs::MemFilesystem::new();
+    fuser::mount2(fs, &mount_path, &[MountOption::RW, MountOption::FSName("lockerfs".to_string())])?;
+    decrypt_thread.join().unwrap();
+
+    // Only run unmount_and_decrypt if we didn't receive SIGTERM
+    if !shutdown.is_shutdown() {
+        unmount_and_decrypt(&encrypted_path, password)?;
+    }
+
+    Ok(())
+}
+
+pub fn unmount_and_decrypt(encrypted_path: &Path, password: &str) -> std::io::Result<()> {
+    let file_name = encrypted_path.file_name().unwrap().to_string_lossy();
+    let mount_path = Path::new("/media").join(file_name.as_ref());
+    let temp_encrypted_path = encrypted_path.with_extension("part");
+
+    // Set up Ctrl+C handler
+    CTRL_C.set_mount_path(mount_path.clone());
+    let shutdown = CTRL_C.get_shutdown();
+
+    info!("Encrypting contents to temporary file {}...", temp_encrypted_path.display());
+    
+    // Encrypt the contents to the temporary file using AES-GCM-SIV
+    if let Err(e) = encrypt_folder(&mount_path, &temp_encrypted_path, password, EncryptionAlgorithm::Aes256GcmSiv, shutdown.clone()) {
+        error!("Failed to encrypt folder: {}", e);
+        // Clean up the temporary file if it exists
+        let _ = std::fs::remove_file(&temp_encrypted_path);
+        let _ = cleanup_mount(&mount_path);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+    }
+
+    info!("Replacing original encrypted file...");
+    
+    // Remove the original file and rename the temporary file
+    std::fs::remove_file(encrypted_path)?;
+    std::fs::rename(&temp_encrypted_path, encrypted_path)?;
+
+    cleanup_mount(&mount_path)?;
+
+    info!("Unmount and re-encryption completed successfully");
+    Ok(())
+}
+
+fn cleanup_mount(mount_path: &Path) -> std::io::Result<()> {
+    // Unmount the filesystem
+    info!("Unmounting filesystem at {}...", mount_path.display());
+    match Command::new("sudo")
+        .arg("umount")
+        .arg(&mount_path)
+        .status()
+    {
+        Ok(_) => {
+            info!("Unmounted filesystem at {}...", &mount_path.display());
+        }
+        Err(e) => {
+            error!("Failed to unmount filesystem at {}: {}", &mount_path.display(), e);
+        }
+    }
+
+    // Clean up the mount point
+    info!("Cleaning filesystem at {}...", &mount_path.display());
+    match Command::new("sudo")
+        .arg("rmdir")
+        .arg(&mount_path)
+        .status()
+    {
+        Ok(_) => {
+            info!("Cleaned filesystem at {}...", &mount_path.display());
+        }
+        Err(e) => {
+            error!("Failed to clean filesystem at {}: {}", &mount_path.display(), e);
+        }
+    }
+
+
+    Ok(())
+}
+
+// Keep sudo alive to avoid sudo timeout
+// Refreshes every 2 minutes
+pub fn sudo_keep_alive() -> std::io::Result<()> {
+    // Initial sudo check
+    Command::new("sudo").arg("-v").status()?;
+
+    // Spawn thread to keep sudo alive
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(120)); // 2 minutes
+            let _ = Command::new("sudo").arg("-v").status();
+        }
+    });
+
+    Ok(())
+}
+
+pub fn is_mount(path: &Path) -> io::Result<()> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(1);
+    let check_interval = Duration::from_millis(5);
+
+    while start.elapsed() < timeout {
+        // Check if the path exists and is a directory
+        if !path.exists() || !path.is_dir() {
+            thread::sleep(check_interval);
+            continue;
+        }
+
+        let path_meta = std::fs::metadata(path)?;
+        let parent = path.parent().unwrap_or(path); // handle `/`
+    
+        if path == parent {
+            return Ok(()); // root is always a mount point
+        }
+
+        let parent_meta = std::fs::metadata(parent)?;
+        let is_mount = path_meta.dev() != parent_meta.dev();
+        if is_mount {
+            return Ok(());
+        }
+
+        thread::sleep(check_interval);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("Timeout waiting for mount at {}", path.display())
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,7 +1133,7 @@ mod tests {
         let (test_dir, decrypted_dir) = setup_test_files(structure);
         
         // Encrypt
-        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", algorithm)?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", algorithm, LazyShutdown::new())?;
 
         // Verify encrypted file
         let encrypted_file = test_dir.with_extension("encrypted");
@@ -926,7 +1141,7 @@ mod tests {
         assert!(fs::metadata(&encrypted_file)?.len() > 0, "Encrypted file is empty");
 
         // Decrypt
-        decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword")?;
+        decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword", LazyShutdown::new())?;
 
         // Verify decrypted files
         verify_decrypted_files(&decrypted_dir, structure);
@@ -1002,11 +1217,11 @@ mod tests {
         let (test_dir, decrypted_dir) = setup_test_files("mixed");
         
         // Encrypt using ChaCha20Poly1305
-        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "correct_password", EncryptionAlgorithm::ChaCha20Poly1305)?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "correct_password", EncryptionAlgorithm::ChaCha20Poly1305, LazyShutdown::new())?;
 
         // Try to decrypt with wrong password
         let encrypted_file = test_dir.with_extension("encrypted");
-        let result = decrypt_folder(&encrypted_file, &decrypted_dir, "wrong_password");
+        let result = decrypt_folder(&encrypted_file, &decrypted_dir, "wrong_password", LazyShutdown::new());
         assert!(result.is_err(), "Decryption with wrong password should fail");
 
         // Cleanup
@@ -1019,14 +1234,14 @@ mod tests {
         init_logger();
         let (test_dir, decrypted_dir) = setup_test_files("mixed");
         // Encrypt using AES-GCM-SIV
-        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", EncryptionAlgorithm::Aes256GcmSiv)?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", EncryptionAlgorithm::Aes256GcmSiv, LazyShutdown::new())?;
         // Corrupt the encrypted file
         let encrypted_file = test_dir.with_extension("encrypted");
         let mut content = fs::read(&encrypted_file)?;
         content[100] = content[100].wrapping_add(1); // Modify one byte
         fs::write(&encrypted_file, content)?;
         // Try to decrypt corrupted file
-        let result = decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword");
+        let result = decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword", LazyShutdown::new());
         assert!(result.is_err(), "Decryption of corrupted file should fail");
         // Cleanup
         cleanup_test_files(&test_dir, &decrypted_dir);

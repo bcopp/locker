@@ -1,3 +1,6 @@
+//! Source: https://github.com/gz/btfs
+//! Written by: "Ben Parli <bparli@gmail.com>", "Gerd Zellweger <mail@gerdzellweger.com>"
+
 //! A simple implementation of an in-memory files-sytem written in Rust using the BTreeMap
 //! data-structure.
 //!
@@ -7,8 +10,10 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::iter;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::thread;
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::MountOption;
 use fuser::{
@@ -16,8 +21,12 @@ use fuser::{
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use log::{debug, error, info, trace};
+
+use crate::core::{decrypt_folder, LazyShutdown};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -26,6 +35,7 @@ pub type InodeId = u64;
 // Re-export reused structs from fuse:
 pub use fuser::FileAttr;
 pub use fuser::FileType;
+
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum Error {
@@ -68,14 +78,14 @@ pub struct SetAttrRequest {
     pub flags: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
-pub struct MemFile {
+#[derive(Debug)]
+struct MemFile {
     bytes: Vec<u8>,
     ino: u64,
 }
 
 impl MemFile {
-    pub fn new() -> MemFile {
+    fn new() -> MemFile {
         MemFile { bytes: Vec::new(), ino: 0 }
     }
 
@@ -116,7 +126,7 @@ impl MemFile {
 }
 
 #[derive(Debug, Clone)]
-pub struct Inode {
+struct Inode {
     name: String,
     children: BTreeMap<String, u64>,
     parent: Option<u64>,
@@ -181,13 +191,13 @@ impl MemFilesystem {
         self.next_inode
     }
 
-    pub fn getattr(&mut self, ino: u64) -> Result<&FileAttr, Error> {
+    fn getattr(&mut self, ino: u64) -> Result<&FileAttr, Error> {
         debug!("getattr(ino={})", ino);
         self.attrs.get(&ino).ok_or(Error::NoEntry)
     }
 
     /// Updates the attributes on an inode with values in `new_attrs`.
-    pub fn setattr(&mut self, ino: u64, new_attrs: SetAttrRequest) -> Result<&FileAttr, Error> {
+    fn setattr(&mut self, ino: u64, new_attrs: SetAttrRequest) -> Result<&FileAttr, Error> {
         debug!("setattr(ino={}, new_attrs={:?})", ino, new_attrs);
         let mut file_attrs = self.attrs.get_mut(&ino).ok_or(Error::NoEntry)?;
 
@@ -220,7 +230,7 @@ impl MemFilesystem {
         Ok(file_attrs)
     }
 
-    pub fn readdir(
+    fn readdir(
         &mut self,
         ino: InodeId,
         _fh: u64,
@@ -245,7 +255,7 @@ impl MemFilesystem {
         })
     }
 
-    pub fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<&FileAttr, Error> {
+    fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<&FileAttr, Error> {
         let name_str = name.to_str().unwrap();
         debug!("lookup(parent={}, name={})", parent, name_str);
 
@@ -254,7 +264,7 @@ impl MemFilesystem {
         self.attrs.get(inode).ok_or(Error::NoEntry)
     }
 
-    pub fn rmdir(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
+    fn rmdir(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
         let name_str = name.to_str().unwrap();
         debug!("rmdir(parent={}, name={})", parent, name_str);
 
@@ -276,7 +286,7 @@ impl MemFilesystem {
         }
     }
 
-    pub fn mkdir(&mut self, parent: u64, name: &OsStr, _mode: u32) -> Result<&FileAttr, Error> {
+    fn mkdir(&mut self, parent: u64, name: &OsStr, _mode: u32) -> Result<&FileAttr, Error> {
         let name_str = name.to_str().unwrap();
         debug!("mkdir(parent={}, name={})", parent, name_str);
 
@@ -320,7 +330,7 @@ impl MemFilesystem {
         }
     }
 
-    pub fn unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
+    fn unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
         let name_str = name.to_str().unwrap();
         debug!("unlink(parent={}, name={})", parent, name_str);
 
@@ -349,7 +359,7 @@ impl MemFilesystem {
         Ok(())
     }
 
-    pub fn create(
+    fn create(
         &mut self,
         parent: u64,
         name: &OsStr,
@@ -416,7 +426,7 @@ impl MemFilesystem {
         }
     }
 
-    pub fn write(
+    fn write(
         &mut self,
         ino: u64,
         fh: u64,
@@ -451,7 +461,7 @@ impl MemFilesystem {
         Ok(size)
     }
 
-    pub fn read(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> Result<&[u8], Error> {
+    fn read(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> Result<&[u8], Error> {
         debug!(
             "read(ino={}, fh={}, offset={}, size={})",
             ino, fh, offset, size
@@ -469,7 +479,7 @@ impl MemFilesystem {
     }
 
     /// Rename a file.
-    pub fn rename(
+    fn rename(
         &mut self,
         parent: u64,
         current_name: &OsStr,
@@ -686,78 +696,3 @@ impl Filesystem for MemFilesystem {
         }
     }
 }
-
-pub fn mount_and_decrypt(encrypted_path: &Path, password: &str) -> std::io::Result<()> {
-    use std::process::Command;
-    let file_name = encrypted_path.file_name().unwrap().to_string_lossy();
-    let mount_path = Path::new("/media").join(file_name.as_ref());
-
-    info!("Requesting sudo to mount file system at {}...", mount_path.display());
-
-    Command::new("sudo").arg("-v").status()?;
-    Command::new("sudo").arg("mkdir").arg("-p").arg(&mount_path).status()?;
-    Command::new("sudo").arg("chown").arg("-R").arg(format!("{}:{}", whoami::username(), whoami::username())).arg(&mount_path).status()?;
-    Command::new("sudo").arg("chmod").arg("-R").arg("755").arg(&mount_path).status()?;
-
-    // Decrypt the folder in a separate thread
-    let encrypted_path_cpy = encrypted_path.to_path_buf();
-    let mount_path_cpy = mount_path.to_path_buf();
-    let password_cpy = password.to_string();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(100));
-        info!("Decrypting folder...");
-        if let Err(e) = crate::core::decrypt_folder(&encrypted_path_cpy, &mount_path_cpy, &password_cpy) {
-            error!("Failed to decrypt folder: {}", e);
-        }
-        info!("Decryption complete");
-    });
-
-
-    // Mount the FUSE filesystem
-    let fs = MemFilesystem::new();
-    fuser::mount2(fs, &mount_path, &[MountOption::RW, MountOption::FSName("lockerfs".to_string())])?;
-    unmount_and_decrypt(&encrypted_path, password)?;
-
-
-    Ok(())
-}
-
-pub fn unmount_and_decrypt(encrypted_path: &Path, password: &str) -> std::io::Result<()> {
-    use std::process::Command;
-    let file_name = encrypted_path.file_name().unwrap().to_string_lossy();
-    let mount_path = Path::new("/media").join(file_name.as_ref());
-    let temp_encrypted_path = encrypted_path.with_extension("part");
-
-    info!("Encrypting contents to temporary file {}...", temp_encrypted_path.display());
-    
-    // Encrypt the contents to the temporary file using AES-GCM-SIV
-    if let Err(e) = crate::core::encrypt_folder(&mount_path, &temp_encrypted_path, password, crate::core::EncryptionAlgorithm::Aes256GcmSiv) {
-        error!("Failed to encrypt folder: {}", e);
-        // Clean up the temporary file if it exists
-        let _ = std::fs::remove_file(&temp_encrypted_path);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-    }
-
-    info!("Unmounting filesystem at {}...", mount_path.display());
-    
-    // Unmount the filesystem
-    Command::new("sudo")
-        .arg("umount")
-        .arg(&mount_path)
-        .status()?;
-
-    info!("Replacing original encrypted file...");
-    
-    // Remove the original file and rename the temporary file
-    std::fs::remove_file(encrypted_path)?;
-    std::fs::rename(&temp_encrypted_path, encrypted_path)?;
-
-    // Clean up the mount point
-    Command::new("sudo")
-        .arg("rmdir")
-        .arg(&mount_path)
-        .status()?;
-
-    info!("Unmount and re-encryption completed successfully");
-    Ok(())
-} 
