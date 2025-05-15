@@ -9,25 +9,28 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::iter;
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Mutex};
+use std::{iter, thread};
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, SystemTime};
 use fuser::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
+use libc::{c_int, sleep, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
 
 use log::{debug, info, trace};
 
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(2);
 
 pub type InodeId = u64;
 
 // Re-export reused structs from fuse:
 pub use fuser::FileAttr;
 pub use fuser::FileType;
+use tar::Header;
 
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -71,7 +74,7 @@ pub struct SetAttrRequest {
     pub flags: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MemFile {
     bytes: Vec<u8>,
     ino: u64,
@@ -140,6 +143,7 @@ pub struct MemFilesystem {
     attrs: BTreeMap<u64, FileAttr>,
     inodes: BTreeMap<u64, Inode>,
     next_inode: u64,
+    on_destroy: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl MemFilesystem {
@@ -175,6 +179,7 @@ impl MemFilesystem {
             attrs: attrs,
             inodes: inodes,
             next_inode: 2,
+            on_destroy: None,
         }
     }
 
@@ -514,6 +519,10 @@ impl Default for MemFilesystem {
 }
 
 impl Filesystem for MemFilesystem {
+    /// Clean up filesystem.
+    /// Called on filesystem exit.
+    fn destroy(&mut self) {}
+
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.getattr(ino) {
             Ok(attr) => {
@@ -559,6 +568,7 @@ impl Filesystem for MemFilesystem {
         match self.setattr(ino, new_attrs) {
             Ok(attr) => reply.attr(&TTL, attr),
             Err(e) => reply.error(e.into()),
+
         }
     }
 
@@ -570,14 +580,15 @@ impl Filesystem for MemFilesystem {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+
         match self.readdir(ino, fh) {
             Ok(entries) => {
-                // Offset of 0 means no offset.
-                // Non-zero offset means the passed offset has already been seen,
-                // and we should start after it.
-                let to_skip = if offset == 0 { 0 } else { offset + 1 } as usize;
-                for (i, entry) in entries.into_iter().enumerate().skip(to_skip) {
-                    reply.add(entry.0, i as i64, entry.1, entry.2);
+                // Skip entries up to the offset
+                for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                    // Use the actual offset for the next readdir call
+                    if !reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                        break;
+                    }
                 }
                 reply.ok();
             }

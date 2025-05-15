@@ -1,0 +1,10 @@
+[package]
+name = "locker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+locker-core = { path = "../locker-core" }
+clap = { version = "4.5.1", features = ["derive"] }
+atty = "0.2.14"
+rpassword = "7.2.0"

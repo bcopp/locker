@@ -1,6 +1,6 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::fs::File;
+use std::fs::{DirEntry, File};
 use std::io::{self, Read, Write};
 use std::thread;
 use crossbeam::channel::{self, Sender, Receiver};
@@ -12,7 +12,7 @@ use aes_gcm_siv::{
     aead::{Aead as AesAead, KeyInit as AesKeyInit},
     Aes256GcmSiv, Key as AesKey, Nonce as AesNonce
 };
-use tar::{Builder, Archive};
+use tar::{Archive, Builder};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use argon2::Argon2;
@@ -28,6 +28,8 @@ use fuser::{MountOption, Filesystem};
 use std::sync::LazyLock;
 use ctrlc;
 use whoami;
+
+use crate::locker::try_cleanup_mount;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 const NONCE_SIZE: usize = 12; // ChaCha20Poly1305 nonce size
@@ -46,6 +48,60 @@ const LOCKER_ID: [u8; 64] = [
 ];
 
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Global runtime context for storing and accessing program state
+/// 
+/// This struct maintains runtime information that needs to be accessed throughout
+/// the program's execution, such as:
+/// - The encryption/decryption algorithm currently in use
+/// - The version of the encrypted file format being processed
+/// - Other runtime configuration that needs to be globally accessible
+///
+/// The context is stored in a thread-safe manner using Mutex locks.
+///
+/// # Example
+/// ```
+/// // Get the current encryption algorithm
+/// let algorithm = RUNTIME_CTX.get_algorithm();
+/// 
+/// // Set a new version
+/// RUNTIME_CTX.set_version(2);
+/// ```
+pub struct RuntimeCtx {
+    /// The version number of the encrypted file format being processed
+    version: Mutex<u32>,
+    
+    /// The encryption algorithm currently being used
+    algorithm: Mutex<EncryptionAlgorithm>,
+}
+
+/// Global static instance of the runtime context
+pub static RUNTIME_CTX: LazyLock<RuntimeCtx> = LazyLock::new(|| RuntimeCtx::new());
+
+impl RuntimeCtx {
+    pub fn new() -> Self {
+        Self {
+            version: Mutex::new(1),
+            algorithm: Mutex::new(EncryptionAlgorithm::ChaCha20Poly1305),
+        }
+    }
+
+    pub fn get_version(&self) -> u32 {
+        *self.version.lock().unwrap()
+    }
+
+    pub fn set_version(&self, version: u32) {
+        *self.version.lock().unwrap() = version;
+    }
+
+    pub fn get_algorithm(&self) -> EncryptionAlgorithm {
+        *self.algorithm.lock().unwrap()
+    }
+
+    pub fn set_algorithm(&self, algorithm: EncryptionAlgorithm) {
+        *self.algorithm.lock().unwrap() = algorithm;
+    }
+}
 
 #[derive(Debug)]
 pub struct LazyShutdown {
@@ -111,20 +167,20 @@ impl Clone for LazyShutdown {
 
 pub struct CtrlC {
     shutdown: LazyShutdown,
-    mount_path: Arc<Mutex<Option<PathBuf>>>,
+    fs_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl CtrlC {
     fn new() -> Self {
         Self {
             shutdown: LazyShutdown::new(),
-            mount_path: Arc::new(Mutex::new(None)),
+            fs_path: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub fn set_mount_path(&self, path: PathBuf) {
-        if let Ok(mut mount_path) = self.mount_path.lock() {
-            *mount_path = Some(path);
+    pub fn set_fs_path(&self, fs_path: PathBuf) {
+        if let Ok(mut self_fs_path) = self.fs_path.lock() {
+            *self_fs_path = Some(fs_path);
         }
     }
 
@@ -133,9 +189,9 @@ impl CtrlC {
     }
 
     pub fn handle_ctrlc(&self) {
-        if let Ok(mount_path) = self.mount_path.lock() {
-            if let Some(path) = mount_path.as_ref() {
-                let _ = cleanup_mount(path);
+        if let Ok(fs_path) = self.fs_path.lock() {
+            if let Some(path) = fs_path.as_ref() {
+                let _ = try_cleanup_mount(path);
             }
         }
         self.shutdown.request_shutdown("Received Ctrl+C signal");
@@ -155,7 +211,7 @@ impl Clone for CtrlC {
     fn clone(&self) -> Self {
         Self {
             shutdown: self.shutdown.clone(),
-            mount_path: Arc::clone(&self.mount_path),
+            fs_path: Arc::clone(&self.fs_path),
         }
     }
 }
@@ -187,7 +243,7 @@ impl EncryptionAlgorithm {
 struct Header {
     version: u32,
     salt: [u8; 32],
-    algorithm: String,
+    algorithm: EncryptionAlgorithm,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -302,6 +358,9 @@ fn stream_tar(
     data_sender: Sender<Chunk>,
     mut shutdown: LazyShutdown,
 ) -> io::Result<()> {
+
+    let mut builder = Builder::new(Vec::new());
+
     debug!("Starting tar creation for {}", folder_path.display());
     let mut builder = Builder::new(Vec::new());
     add_directory_to_tar(&mut builder, folder_path)?;
@@ -630,9 +689,9 @@ pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, al
     let header = Header {
         version: 1,
         salt,
-        algorithm: algorithm.to_string(),
+        algorithm: algorithm,
     };
-    debug!("Encrypting with algorithm: {}", header.algorithm);
+    debug!("Encrypting with algorithm: {}", header.algorithm.to_string());
 
     // Write header
     serialize_into(&mut output_file, &header).unwrap();
@@ -697,16 +756,22 @@ pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str,
     debug!("Verified Locker ID");
 
     // Read and verify header
-    let header: Header = deserialize_from(&mut encrypted_file).unwrap();
-    debug!("Decrypting with algorithm: {}", header.algorithm);
-    
-    // Parse algorithm
-    let algorithm = EncryptionAlgorithm::from_string(&header.algorithm)
-        .ok_or_else(|| io::Error::new(
+    let header: Header = if let Ok(header) = deserialize_from(&mut encrypted_file) {
+        header
+    } else {
+        error!("Invalid file format: Could not deserialize header");
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Unsupported encryption algorithm: {}", header.algorithm)
-        ))?;
+            "Invalid file format: Could not deserialize header"
+        ));
+    };
 
+    debug!("Decrypting with algorithm: {}", header.algorithm.to_string());
+
+    // SETTING GLOBAL RUNTIME CTX
+    RUNTIME_CTX.set_version(header.version);
+    RUNTIME_CTX.set_algorithm(header.algorithm);
+    
     // Create channels for streaming
     let (encrypted_sender, encrypted_receiver) = channel::bounded(10);
     let (decrypted_sender, decrypted_receiver) = channel::bounded(10);
@@ -714,7 +779,7 @@ pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str,
 
     // Create decrypter
     let key = derive_key(password, &header.salt);
-    let decrypter = StreamDecrypter::new(algorithm, &key);
+    let decrypter = StreamDecrypter::new(header.algorithm, &key);
     debug!("Created decrypter");
 
     // Spawn threads
@@ -766,248 +831,6 @@ fn add_directory_to_tar(builder: &mut Builder<Vec<u8>>, path: &Path) -> io::Resu
     }
     
     Ok(())
-}
-
-fn encrypt_file(
-    input_path: &Path,
-    output_path: &Path,
-    password: &str,
-    algorithm: &str,
-) -> io::Result<()> {
-    // Create output file
-    let mut output_file = File::create(output_path)?;
-
-    // Write Locker ID
-    output_file.write_all(&LOCKER_ID)?;
-
-    // Generate salt
-    let mut salt = [0u8; 32];
-    OsRng.fill(&mut salt);
-
-    // Create header
-    let header = Header {
-        version: 1,
-        salt,
-        algorithm: algorithm.to_string(),
-    };
-
-    // Write header
-    serialize_into(&mut output_file, &header).unwrap();
-
-    // Create encrypter
-    let key = derive_key(password, &salt);
-    let encrypter = StreamEncrypter::new(EncryptionAlgorithm::from_string(algorithm).unwrap(), &key);
-
-    // Read input file
-    let mut input_file = File::open(input_path)?;
-    let mut buffer = Vec::new();
-    input_file.read_to_end(&mut buffer)?;
-
-    // Encrypt data
-    let encrypted_chunk = encrypter.encrypt(0, &buffer)?;
-    serialize_into(&mut output_file, &encrypted_chunk).unwrap();
-
-    Ok(())
-}
-
-fn decrypt_file(
-    input_path: &Path,
-    output_path: &Path,
-    password: &str,
-) -> io::Result<()> {
-    // Open encrypted file
-    let mut input_file = File::open(input_path)?;
-
-    // Verify Locker ID
-    let mut id_buffer = [0u8; 64];
-    input_file.read_exact(&mut id_buffer)?;
-    if id_buffer != LOCKER_ID {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid file format: Not a Locker AI encrypted file"
-        ));
-    }
-
-    // Read and verify header
-    let header: Header = deserialize_from(&mut input_file).unwrap();
-
-    // Create decrypter
-    let key = derive_key(password, &header.salt);
-    let decrypter = StreamDecrypter::new(EncryptionAlgorithm::from_string(&header.algorithm).unwrap(), &key);
-
-    // Read encrypted chunk
-    let encrypted_chunk: EncryptedChunk = deserialize_from(&mut input_file).unwrap();
-
-    // Decrypt data
-    let plaintext = decrypter.decrypt(&encrypted_chunk)?;
-
-    // Write decrypted data
-    let mut output_file = File::create(output_path)?;
-    output_file.write_all(&plaintext)?;
-    Ok(())
-}
-
-
-pub fn mount_and_decrypt(encrypted_path: &Path, password: &str) -> std::io::Result<()> {
-    let file_name = encrypted_path.file_name().unwrap().to_string_lossy();
-    let mount_path = Path::new("/media").join(file_name.as_ref());
-
-    // Set up Ctrl+C handler
-    CTRL_C.set_mount_path(mount_path.clone());
-
-    info!("Requesting sudo to mount file system at {}...", &mount_path.display());
-
-    Command::new("sudo").arg("-v").status()?;
-    Command::new("sudo").arg("mkdir").arg("-p").arg(&mount_path).status()?;
-    Command::new("sudo").arg("chown").arg(format!("{}:{}", whoami::username(), whoami::username())).arg(&mount_path).status()?;
-    Command::new("sudo").arg("chmod").arg("777").arg(&mount_path).status()?;
-
-    let shutdown = CTRL_C.get_shutdown();
-
-    let encrypted_path_clone = encrypted_path.to_path_buf();
-    let password_clone = password.to_string();
-    let shutdown_clone = shutdown.clone();
-    let mount_path_clone = mount_path.clone();
-    let decrypt_thread = std::thread::spawn(move || {
-        match is_mount(&mount_path_clone) {
-            Ok(()) => {
-                let _ = decrypt_folder(&encrypted_path_clone, &mount_path_clone, &password_clone, shutdown_clone.clone());
-            }
-            Err(e) => {
-                error!("Failed to mount and decrypt: {}", e);
-            }
-        }
-    });
-
-    // Mount and decrypt
-    let fs = crate::fusefs::MemFilesystem::new();
-    fuser::mount2(fs, &mount_path, &[MountOption::RW, MountOption::FSName("lockerfs".to_string())])?;
-    decrypt_thread.join().unwrap();
-
-    // Only run unmount_and_decrypt if we didn't receive SIGTERM
-    if !shutdown.is_shutdown() {
-        unmount_and_decrypt(&encrypted_path, password)?;
-    }
-
-    Ok(())
-}
-
-pub fn unmount_and_decrypt(encrypted_path: &Path, password: &str) -> std::io::Result<()> {
-    let file_name = encrypted_path.file_name().unwrap().to_string_lossy();
-    let mount_path = Path::new("/media").join(file_name.as_ref());
-    let temp_encrypted_path = encrypted_path.with_extension("part");
-
-    // Set up Ctrl+C handler
-    CTRL_C.set_mount_path(mount_path.clone());
-    let shutdown = CTRL_C.get_shutdown();
-
-    info!("Encrypting contents to temporary file {}...", temp_encrypted_path.display());
-    
-    // Encrypt the contents to the temporary file using AES-GCM-SIV
-    if let Err(e) = encrypt_folder(&mount_path, &temp_encrypted_path, password, EncryptionAlgorithm::Aes256GcmSiv, shutdown.clone()) {
-        error!("Failed to encrypt folder: {}", e);
-        // Clean up the temporary file if it exists
-        let _ = std::fs::remove_file(&temp_encrypted_path);
-        let _ = cleanup_mount(&mount_path);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-    }
-
-    info!("Replacing original encrypted file...");
-    
-    // Remove the original file and rename the temporary file
-    std::fs::remove_file(encrypted_path)?;
-    std::fs::rename(&temp_encrypted_path, encrypted_path)?;
-
-    cleanup_mount(&mount_path)?;
-
-    info!("Unmount and re-encryption completed successfully");
-    Ok(())
-}
-
-fn cleanup_mount(mount_path: &Path) -> std::io::Result<()> {
-    // Unmount the filesystem
-    info!("Unmounting filesystem at {}...", mount_path.display());
-    match Command::new("sudo")
-        .arg("umount")
-        .arg(&mount_path)
-        .status()
-    {
-        Ok(_) => {
-            info!("Unmounted filesystem at {}...", &mount_path.display());
-        }
-        Err(e) => {
-            error!("Failed to unmount filesystem at {}: {}", &mount_path.display(), e);
-        }
-    }
-
-    // Clean up the mount point
-    info!("Cleaning filesystem at {}...", &mount_path.display());
-    match Command::new("sudo")
-        .arg("rmdir")
-        .arg(&mount_path)
-        .status()
-    {
-        Ok(_) => {
-            info!("Cleaned filesystem at {}...", &mount_path.display());
-        }
-        Err(e) => {
-            error!("Failed to clean filesystem at {}: {}", &mount_path.display(), e);
-        }
-    }
-
-
-    Ok(())
-}
-
-// Keep sudo alive to avoid sudo timeout
-// Refreshes every 2 minutes
-pub fn sudo_keep_alive() -> std::io::Result<()> {
-    // Initial sudo check
-    Command::new("sudo").arg("-v").status()?;
-
-    // Spawn thread to keep sudo alive
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(120)); // 2 minutes
-            let _ = Command::new("sudo").arg("-v").status();
-        }
-    });
-
-    Ok(())
-}
-
-pub fn is_mount(path: &Path) -> io::Result<()> {
-    let start = Instant::now();
-    let timeout = Duration::from_secs(1);
-    let check_interval = Duration::from_millis(5);
-
-    while start.elapsed() < timeout {
-        // Check if the path exists and is a directory
-        if !path.exists() || !path.is_dir() {
-            thread::sleep(check_interval);
-            continue;
-        }
-
-        let path_meta = std::fs::metadata(path)?;
-        let parent = path.parent().unwrap_or(path); // handle `/`
-    
-        if path == parent {
-            return Ok(()); // root is always a mount point
-        }
-
-        let parent_meta = std::fs::metadata(parent)?;
-        let is_mount = path_meta.dev() != parent_meta.dev();
-        if is_mount {
-            return Ok(());
-        }
-
-        thread::sleep(check_interval);
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("Timeout waiting for mount at {}", path.display())
-    ))
 }
 
 #[cfg(test)]
