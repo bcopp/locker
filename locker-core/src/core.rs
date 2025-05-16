@@ -28,6 +28,7 @@ use fuser::{MountOption, Filesystem};
 use std::sync::LazyLock;
 use ctrlc;
 use whoami;
+use anyhow::{Context, Result, anyhow};
 
 use crate::locker::try_cleanup_mount;
 
@@ -320,9 +321,9 @@ impl StreamDecrypter {
     }
 }
 
-fn send_chunk<T>(sender: &Sender<T>, data: T) -> io::Result<()> {
+fn send_chunk<T>(sender: &Sender<T>, data: T) -> Result<()> {
     sender.send(data)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Channel send error"))
+        .map_err(|_| anyhow!("Channel send error"))
 }
 
 #[derive(Debug)]
@@ -357,17 +358,25 @@ fn stream_tar(
     folder_path: &Path,
     data_sender: Sender<Chunk>,
     mut shutdown: LazyShutdown,
-) -> io::Result<()> {
-
+) -> Result<()> {
     let mut builder = Builder::new(Vec::new());
+
+    let folder_path = get_relative_path(folder_path)
+        .context("Failed to get relative path for tar creation")?;
 
     debug!("Starting tar creation for {}", folder_path.display());
     let mut builder = Builder::new(Vec::new());
-    add_directory_to_tar(&mut builder, folder_path)?;
-    let tar_data = builder.into_inner()?;
+
+    add_directory_to_tar(&mut builder, folder_path.as_path())
+        .context("Failed to add directory to tar")?;
+
+        //builder.append_dir_all(".", src_path)
+
+    let tar_data = builder.into_inner()
+        .context("Failed to finalize tar archive")?;
     for (i, chunk) in tar_data.chunks(CHUNK_SIZE).enumerate() {
         if let Some(msg) = shutdown.should_shutdown() {
-            return Err(io::Error::new(io::ErrorKind::Other, msg));
+            return Err(anyhow!(msg));
         }
         debug!("Sending chunk {} of size {}", i, chunk.len());
         send_chunk(&data_sender, Chunk {
@@ -384,11 +393,11 @@ fn stream_encrypter(
     encrypted_sender: Sender<Chunk>,
     encrypter: StreamEncrypter,
     shutdown: LazyShutdown,
-) -> io::Result<()> {
+) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(get_max_threads())
         .build()
-        .unwrap();
+        .context("Failed to create thread pool")?;
     for _ in 0..get_max_threads() {
         let mut shutdown = shutdown.clone();
         let encrypter = encrypter.clone();
@@ -448,7 +457,7 @@ fn stream_reorderer(
     decrypted_receiver: Receiver<Chunk>,
     ordered_sender: Sender<Vec<u8>>,
     mut shutdown: LazyShutdown,
-) -> io::Result<()> {
+) -> Result<()> {
     debug!("Starting reordering");
     let mut next_sequence = 0;
     let mut buffer = BTreeMap::new();
@@ -456,7 +465,7 @@ fn stream_reorderer(
         match decrypted_receiver.recv_timeout(TIMEOUT_INTERVAL) {
             Ok(chunk) => {
                 if let Some(msg) = shutdown.should_shutdown() {
-                    return Err(io::Error::new(io::ErrorKind::Other, msg));
+                    return Err(anyhow!(msg));
                 }
                 buffer.insert(chunk.sequence_id, chunk.data);
                 while let Some(data) = buffer.remove(&next_sequence) {
@@ -464,14 +473,14 @@ fn stream_reorderer(
                         Ok(_) => next_sequence += 1,
                         Err(e) => {
                             shutdown.request_shutdown(&format!("Failed to send ordered chunk: {}", e));
-                            return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                            return Err(anyhow!("Failed to send ordered chunk: {}", e));
                         }
                     }
                 }
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                 if let Some(msg) = shutdown.should_shutdown() {
-                    return Err(io::Error::new(io::ErrorKind::Other, msg));
+                    return Err(anyhow!(msg));
                 }
                 continue;
             }
@@ -487,20 +496,22 @@ fn stream_writer(
     mut output_file: File,
     ordered_receiver: Receiver<Vec<u8>>,
     mut shutdown: LazyShutdown,
-) -> io::Result<()> {
+) -> Result<()> {
     loop {
         match ordered_receiver.recv_timeout(TIMEOUT_INTERVAL) {
             Ok(chunk) => {
                 if let Some(msg) = shutdown.should_shutdown() {
-                    return Err(io::Error::new(io::ErrorKind::Other, msg));
+                    return Err(anyhow!(msg));
                 }
                 let size = chunk.len() as u64;
-                output_file.write_all(&size.to_le_bytes())?;
-                output_file.write_all(&chunk)?;
+                output_file.write_all(&size.to_le_bytes())
+                    .context("Failed to write chunk size")?;
+                output_file.write_all(&chunk)
+                    .context("Failed to write chunk data")?;
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                 if let Some(msg) = shutdown.should_shutdown() {
-                    return Err(io::Error::new(io::ErrorKind::Other, msg));
+                    return Err(anyhow!(msg));
                 }
                 continue;
             }
@@ -514,23 +525,25 @@ fn stream_reader(
     mut encrypted_file: File,
     encrypted_sender: Sender<Vec<u8>>,
     mut shutdown: LazyShutdown,
-) -> io::Result<()> {
+) -> Result<()> {
     let mut size_buffer = [0u8; 8];
     loop {
         if let Some(msg) = shutdown.should_shutdown() {
-            return Err(io::Error::new(io::ErrorKind::Other, msg));
+            return Err(anyhow!(msg));
         }
         match encrypted_file.read_exact(&mut size_buffer) {
             Ok(_) => {
                 let size = u64::from_le_bytes(size_buffer) as usize;
                 let mut chunk = vec![0u8; size];
-                encrypted_file.read_exact(&mut chunk)?;
-                send_chunk(&encrypted_sender, chunk)?;
+                encrypted_file.read_exact(&mut chunk)
+                    .context("Failed to read chunk data")?;
+                send_chunk(&encrypted_sender, chunk)
+                    .context("Failed to send chunk")?;
             }
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => {
                 shutdown.request_shutdown(&format!("Error reading encrypted file: {}", e));
-                return Err(e);
+                return Err(anyhow!("Error reading encrypted file: {}", e));
             }
         }
     }
@@ -542,11 +555,11 @@ fn stream_decrypter(
     decrypted_sender: Sender<Chunk>,
     decrypter: StreamDecrypter,
     shutdown: LazyShutdown,
-) -> io::Result<()> {
+) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(get_max_threads())
         .build()
-        .unwrap();
+        .context("Failed to create thread pool")?;
     for _ in 0..get_max_threads() {
         let mut shutdown = shutdown.clone();
         let decrypter = decrypter.clone();
@@ -556,25 +569,24 @@ fn stream_decrypter(
             loop {
                 match encrypted_receiver.recv_timeout(TIMEOUT_INTERVAL) {
                     Ok(chunk) => {
-
                         if let Some(_) = shutdown.should_shutdown() {
                             break;
                         }
 
-                        if shutdown.err_is_shutdown ( 
+                        if shutdown.err_is_shutdown( 
                             (|| {
                                 debug!("Decrypting chunk of size {}", chunk.len());
                                 let encrypted_chunk = match deserialize::<EncryptedChunk>(&chunk) {
                                     Ok(enc) => enc,
                                     Err(e) => {
-                                        return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to deserialize chunk: {}", e)));
+                                        return Err(anyhow!("Failed to deserialize chunk: {}", e));
                                     }
                                 };
 
                                 let decrypted = match decrypter.decrypt(&encrypted_chunk) {
                                     Ok(dec) => dec,
                                     Err(e) => {
-                                        return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to decrypt chunk: {}", e)));
+                                        return Err(anyhow!("Failed to decrypt chunk: {}", e));
                                     }
                                 };
 
@@ -582,17 +594,15 @@ fn stream_decrypter(
                                     sequence_id: encrypted_chunk.sequence_id,
                                     data: decrypted,
                                 }) {
-                                    Ok(_) => {Ok(())},
+                                    Ok(_) => Ok(()),
                                     Err(e) => {
-                                        return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to send decrypted chunk: {}", e)));
+                                        return Err(anyhow!("Failed to send decrypted chunk: {}", e));
                                     }
                                 }
                             })()
                         ) {
                             break;
                         }
-
-
                     }
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                         if let Some(_) = shutdown.should_shutdown() {
@@ -612,23 +622,27 @@ fn stream_extractor(
     output_path: &Path,
     decrypted_receiver: Receiver<Vec<u8>>,
     mut shutdown: LazyShutdown,
-) -> io::Result<()> {
-    let file_name = output_path.iter().last().unwrap();
-    let temp_tar = "/tmp/".to_string() + file_name.to_str().unwrap();
+) -> Result<()> {
+    let file_name = output_path.iter().last()
+        .context("Failed to get file name from path")?;
+    let temp_tar = "/tmp/".to_string() + file_name.to_str()
+        .context("Failed to convert file name to string")?;
     {
-        let mut tar_file = File::create(&temp_tar)?;
+        let mut tar_file = File::create(&temp_tar)
+            .context("Failed to create temporary tar file")?;
         loop {
             match decrypted_receiver.recv_timeout(TIMEOUT_INTERVAL) {
                 Ok(chunk) => {
                     if let Some(msg) = shutdown.should_shutdown() {
-                        return Err(io::Error::new(io::ErrorKind::Other, msg));
+                        return Err(anyhow!(msg));
                     }
 
-                    tar_file.write_all(&chunk)?;
+                    tar_file.write_all(&chunk)
+                        .context("Failed to write chunk to tar file")?;
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                     if let Some(msg) = shutdown.should_shutdown() {
-                        return Err(io::Error::new(io::ErrorKind::Other, msg));
+                        return Err(anyhow!(msg));
                     }
                     continue;
                 }
@@ -637,27 +651,40 @@ fn stream_extractor(
                 }
             }
         }
-        tar_file.flush()?;
+        tar_file.flush()
+            .context("Failed to flush tar file")?;
     }
 
-    let mut archive = Archive::new(File::open(&temp_tar)?);
-    std::fs::create_dir_all(output_path)?;
-    let mut entries = archive.entries()?;
+    let mut archive = Archive::new(File::open(&temp_tar)
+        .context("Failed to open temporary tar file")?);
+    std::fs::create_dir_all(output_path)
+        .context("Failed to create output directory")?;
+    let mut entries = archive.entries()
+        .context("Failed to get archive entries")?;
     let extraction_result = (|| {
         while let Some(entry) = entries.next() {
             if let Some(msg) = shutdown.should_shutdown() {
-                return Err(io::Error::new(io::ErrorKind::Other, msg));
+                return Err(anyhow!(msg));
             }
             let mut entry = entry?;
             let path = entry.path()?;
-            let path = path.strip_prefix(path.components().next().unwrap())
-                .unwrap_or(&path);
-            let target_path = output_path.join(path);
+            
+            // Get the file name without any parent directory components
+            let file_name = path.file_name()
+                .ok_or_else(|| anyhow!("Invalid path: no file name"))?;
+            
+            // Create the target path by joining the output directory with just the file name
+            let target_path = output_path.join(file_name);
+            
+            // Create parent directories if they don't exist
             if let Some(parent) = target_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent)
+                    .context("Failed to create parent directory")?;
             }
 
-            entry.unpack(target_path)?;
+            // Unpack the entry to the target path
+            entry.unpack(&target_path)
+                .context("Failed to unpack entry")?;
         }
         Ok(())
     })();
@@ -665,19 +692,32 @@ fn stream_extractor(
         shutdown.request_shutdown(&format!("Failed to extract tar: {}", e));
         return Err(e);
     }
-    std::fs::remove_file(temp_tar)?;
+    std::fs::remove_file(temp_tar)
+        .context("Failed to remove temporary tar file")?;
     Ok(())
 }
 
-pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, algorithm: EncryptionAlgorithm, shutdown: LazyShutdown) -> io::Result<()> {
+pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, algorithm: EncryptionAlgorithm, shutdown: LazyShutdown) -> Result<()> {
     info!("Starting encryption of {} to {} using {}", folder_path.display(), output_path.display(), algorithm.to_string());
     
-    // Create output file
-    let mut output_file = File::create(output_path)?;
+    // Create output file with better error handling
+    let mut output_file = match File::create(output_path) {
+        Ok(file) => file,
+        Err(e) => {
+            let error_msg = format!(
+                "Failed to create output file at {}: {}. Make sure you have write permissions to the directory.",
+                output_path.display(),
+                e
+            );
+            error!("{}", error_msg);
+            return Err(anyhow!(error_msg));
+        }
+    };
     debug!("Created output file: {}", output_path.display());
 
     // Write Locker ID
-    output_file.write_all(&LOCKER_ID)?;
+    output_file.write_all(&LOCKER_ID)
+        .context("Failed to write Locker ID")?;
     debug!("Wrote Locker ID");
 
     // Generate salt
@@ -694,7 +734,8 @@ pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, al
     debug!("Encrypting with algorithm: {}", header.algorithm.to_string());
 
     // Write header
-    serialize_into(&mut output_file, &header).unwrap();
+    serialize_into(&mut output_file, &header)
+        .context("Failed to serialize header")?;
     debug!("Wrote header");
 
     // Create channels for streaming
@@ -729,29 +770,28 @@ pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, al
 
     // Check if any errors occurred
     if shutdown.is_shutdown() {
-        return Err(io::Error::new(io::ErrorKind::Other, shutdown.get_error_message()));
+        return Err(anyhow!(shutdown.get_error_message()));
     }
 
     info!("Encryption completed successfully");
     Ok(())
 }
 
-pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, shutdown: LazyShutdown) -> io::Result<()> {
+pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, shutdown: LazyShutdown) -> Result<()> {
     info!("Starting decryption of {} to {}", encrypted_path.display(), output_path.display());
     
     // Open encrypted file
-    let mut encrypted_file = File::open(encrypted_path)?;
+    let mut encrypted_file = File::open(encrypted_path)
+        .context("Failed to open encrypted file")?;
     debug!("Opened encrypted file");
 
     // Verify Locker ID
     let mut id_buffer = [0u8; 64];
-    encrypted_file.read_exact(&mut id_buffer)?;
+    encrypted_file.read_exact(&mut id_buffer)
+        .context("Failed to read Locker ID")?;
     if id_buffer != LOCKER_ID {
         error!("Invalid file format: Not a Locker AI encrypted file");
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid file format: Not a Locker AI encrypted file"
-        ));
+        return Err(anyhow!("Invalid file format: Not a Locker AI encrypted file"));
     }
     debug!("Verified Locker ID");
 
@@ -760,10 +800,7 @@ pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str,
         header
     } else {
         error!("Invalid file format: Could not deserialize header");
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid file format: Could not deserialize header"
-        ));
+        return Err(anyhow!("Invalid file format: Could not deserialize header"));
     };
 
     debug!("Decrypting with algorithm: {}", header.algorithm.to_string());
@@ -804,33 +841,141 @@ pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str,
 
     // Check if any errors occurred
     if shutdown.is_shutdown() {
-        return Err(io::Error::new(io::ErrorKind::Other, shutdown.get_error_message()));
+        return Err(anyhow!(shutdown.get_error_message()));
     }
 
     info!("Decryption completed successfully");
     Ok(())
 }
 
+/// Adds a directory and its contents to a tar archive, maintaining relative paths
+///
+/// This function recursively adds a directory and all its contents to a tar archive.
+/// The paths in the archive will be relative to the input directory.
+///
+/// # Arguments
+/// * `builder` - The tar archive builder to add files to
+/// * `path` - The directory path to add. Must be relative to the current directory.
+///
+/// # Returns
+/// * `Ok(())` if the directory was added successfully
+/// * `Err(io::Error)` if any step fails
+///
+/// # Note
+/// The path must be relative to the current directory. Absolute paths will cause errors
+/// in the tar archive.
+///
+/// # Example
+/// ```
+/// use tar::Builder;
+/// use std::path::Path;
+/// 
+/// let mut archive = Builder::new(Vec::new());
+/// let dir_path = Path::new("./my_directory");
+/// add_directory_to_tar(&mut archive, dir_path).unwrap();
+/// ```
+
 fn add_directory_to_tar(builder: &mut Builder<Vec<u8>>, path: &Path) -> io::Result<()> {
     if !path.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Path is not a directory",
+            format!("Path is not a directory: {}", path.display()),
         ));
     }
 
+    // Get the absolute path of the input directory
+    let base_path = std::fs::canonicalize(path)?;
+    
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        let path = entry.path();
+        let entry_path = entry.path();
         
-        if path.is_dir() {
-            add_directory_to_tar(builder, &path)?;
+        if entry_path.is_dir() {
+            add_directory_to_tar(builder, &entry_path)?;
         } else {
-            builder.append_path(&path)?;
+            // Get the absolute path of the file
+            let abs_path = std::fs::canonicalize(&entry_path)?;
+            
+            // Create a relative path by stripping the base path prefix
+            let relative_path = abs_path.strip_prefix(&base_path)
+                .map_err(|e| io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Failed to create relative path: {}", e)
+                ))?;
+            
+            // Add the file to the archive with its relative path
+            match builder.append_path_with_name(&abs_path, relative_path) {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Failed to add file to tar: {}", e);
+                    return Err(e);
+                }
+            }
         }
     }
     
     Ok(())
+}
+
+/// Converts a path to be relative to the current directory
+/// 
+/// # Arguments
+/// * `path` - The path to convert to a relative path
+/// 
+/// # Returns
+/// * `Ok(PathBuf)` containing the relative path if successful
+/// * `Err(io::Error)` if the path cannot be converted to a relative path
+/// 
+/// # Example
+/// ```
+/// use std::path::Path;
+/// 
+/// let absolute_path = Path::new("/home/user/documents/file.txt");
+/// let relative_path = get_relative_path(absolute_path).unwrap();
+/// ```
+pub fn get_relative_path(path: &Path) -> io::Result<PathBuf> {
+    // If path is already relative, return it as is
+    if !path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let current_dir = std::env::current_dir()?;
+    
+    // Get the components of both paths
+    let mut path_components = path.components();
+    let mut current_components = current_dir.components();
+    
+    // Skip common prefix
+    while let (Some(p), Some(c)) = (path_components.next(), current_components.next()) {
+        if p != c {
+            // Found a difference, need to rebuild the path
+            let mut result = PathBuf::new();
+            
+            // Add ".." for the current component where difference was found
+            result.push("..");
+            
+            // Add ".." for each remaining component in current_dir
+            for _ in current_components {
+                result.push("..");
+            }
+            
+            // Add the remaining components from the input path
+            result.push(p);
+            for component in path_components {
+                result.push(component);
+            }
+            
+            return Ok(result);
+        }
+    }
+    
+    // If we get here, the path is a subpath of current_dir
+    let mut result = PathBuf::new();
+    for component in path_components {
+        result.push(component);
+    }
+    
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -949,7 +1094,7 @@ mod tests {
         let (test_dir, decrypted_dir) = setup_test_files(structure);
         
         // Encrypt
-        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", algorithm, LazyShutdown::new())?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", algorithm, LazyShutdown::new()).unwrap();
 
         // Verify encrypted file
         let encrypted_file = test_dir.with_extension("encrypted");
@@ -957,7 +1102,7 @@ mod tests {
         assert!(fs::metadata(&encrypted_file)?.len() > 0, "Encrypted file is empty");
 
         // Decrypt
-        decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword", LazyShutdown::new())?;
+        decrypt_folder(&encrypted_file, &decrypted_dir, "testpassword", LazyShutdown::new()).unwrap();
 
         // Verify decrypted files
         verify_decrypted_files(&decrypted_dir, structure);
@@ -1033,7 +1178,7 @@ mod tests {
         let (test_dir, decrypted_dir) = setup_test_files("mixed");
         
         // Encrypt using ChaCha20Poly1305
-        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "correct_password", EncryptionAlgorithm::ChaCha20Poly1305, LazyShutdown::new())?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "correct_password", EncryptionAlgorithm::ChaCha20Poly1305, LazyShutdown::new()).unwrap();
 
         // Try to decrypt with wrong password
         let encrypted_file = test_dir.with_extension("encrypted");
@@ -1050,7 +1195,7 @@ mod tests {
         init_logger();
         let (test_dir, decrypted_dir) = setup_test_files("mixed");
         // Encrypt using AES-GCM-SIV
-        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", EncryptionAlgorithm::Aes256GcmSiv, LazyShutdown::new())?;
+        encrypt_folder(&test_dir, &test_dir.with_extension("encrypted"), "testpassword", EncryptionAlgorithm::Aes256GcmSiv, LazyShutdown::new()).unwrap();
         // Corrupt the encrypted file
         let encrypted_file = test_dir.with_extension("encrypted");
         let mut content = fs::read(&encrypted_file)?;
@@ -1061,6 +1206,16 @@ mod tests {
         assert!(result.is_err(), "Decryption of corrupted file should fail");
         // Cleanup
         cleanup_test_files(&test_dir, &decrypted_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tar() -> io::Result<()> {
+        init_logger();
+        let file = File::create("test.tar")?;
+        let mut builder = tar::Builder::new(file);
+        builder.append_dir_all(".", "/media/tg")?;
+        builder.finish()?;
         Ok(())
     }
 } 

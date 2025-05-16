@@ -75,7 +75,7 @@ pub struct SetAttrRequest {
 }
 
 #[derive(Debug, Clone)]
-struct MemFile {
+pub struct MemFile {
     bytes: Vec<u8>,
     ino: u64,
 }
@@ -122,7 +122,7 @@ impl MemFile {
 }
 
 #[derive(Debug, Clone)]
-struct Inode {
+pub struct Inode {
     name: String,
     children: BTreeMap<String, u64>,
     parent: Option<u64>,
@@ -139,11 +139,11 @@ impl Inode {
 }
 
 pub struct MemFilesystem {
-    files: BTreeMap<u64, MemFile>,
-    attrs: BTreeMap<u64, FileAttr>,
-    inodes: BTreeMap<u64, Inode>,
-    next_inode: u64,
-    on_destroy: Option<Box<dyn Fn() + Send + Sync>>,
+    pub files: BTreeMap<u64, MemFile>,
+    pub attrs: BTreeMap<u64, FileAttr>,
+    pub inodes: BTreeMap<u64, Inode>,
+    pub next_inode: u64,
+    pub on_destroy: Option<Box<dyn Fn(&mut MemFilesystem) + Send + Sync>>,
 }
 
 impl MemFilesystem {
@@ -521,7 +521,11 @@ impl Default for MemFilesystem {
 impl Filesystem for MemFilesystem {
     /// Clean up filesystem.
     /// Called on filesystem exit.
-    fn destroy(&mut self) {}
+    fn destroy(&mut self) {
+        if let Some(on_destroy) = self.on_destroy.take() {
+            on_destroy(self);
+        }
+    }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.getattr(ino) {

@@ -174,7 +174,7 @@ fn main() -> std::io::Result<()> {
             let fs_path = to_absolute_path(&fs_path)?;
             let password = get_password()?;
 
-            new(&output, &fs_path, password, algorithm.into())
+            new(&output, &fs_path, password, algorithm.into()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
         
         Commands::Open { path, fs_path } => {
@@ -188,7 +188,7 @@ fn main() -> std::io::Result<()> {
             let fs_path = to_absolute_path(&fs_path)?;
             let password = get_password()?;
 
-            open(&path, &fs_path, password)
+            open(&path, &fs_path, password).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
         
         Commands::Encrypt { path, output, algorithm } => {
@@ -201,7 +201,7 @@ fn main() -> std::io::Result<()> {
             let output = to_absolute_path(&output)?;
             
             let password = get_password()?;
-            encrypt(&path, &output, password, algorithm.into())
+            encrypt(&path, &output, password, algorithm.into()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
     }
 } 
