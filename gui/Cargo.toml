@@ -1,0 +1,9 @@
+[package]
+name = "locker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.10", features = ["canvas", "debug", "tokio"] }
+core = { path = "../core" }
+rfd = "0.15.3"

@@ -50,60 +50,6 @@ const LOCKER_ID: [u8; 64] = [
 
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Global runtime context for storing and accessing program state
-/// 
-/// This struct maintains runtime information that needs to be accessed throughout
-/// the program's execution, such as:
-/// - The encryption/decryption algorithm currently in use
-/// - The version of the encrypted file format being processed
-/// - Other runtime configuration that needs to be globally accessible
-///
-/// The context is stored in a thread-safe manner using Mutex locks.
-///
-/// # Example
-/// ```
-/// // Get the current encryption algorithm
-/// let algorithm = RUNTIME_CTX.get_algorithm();
-/// 
-/// // Set a new version
-/// RUNTIME_CTX.set_version(2);
-/// ```
-pub struct RuntimeCtx {
-    /// The version number of the encrypted file format being processed
-    version: Mutex<u32>,
-    
-    /// The encryption algorithm currently being used
-    algorithm: Mutex<EncryptionAlgorithm>,
-}
-
-/// Global static instance of the runtime context
-pub static RUNTIME_CTX: LazyLock<RuntimeCtx> = LazyLock::new(|| RuntimeCtx::new());
-
-impl RuntimeCtx {
-    pub fn new() -> Self {
-        Self {
-            version: Mutex::new(1),
-            algorithm: Mutex::new(EncryptionAlgorithm::ChaCha20Poly1305),
-        }
-    }
-
-    pub fn get_version(&self) -> u32 {
-        *self.version.lock().unwrap()
-    }
-
-    pub fn set_version(&self, version: u32) {
-        *self.version.lock().unwrap() = version;
-    }
-
-    pub fn get_algorithm(&self) -> EncryptionAlgorithm {
-        *self.algorithm.lock().unwrap()
-    }
-
-    pub fn set_algorithm(&self, algorithm: EncryptionAlgorithm) {
-        *self.algorithm.lock().unwrap() = algorithm;
-    }
-}
-
 #[derive(Debug)]
 pub struct LazyShutdown {
     shutdown: Arc<AtomicBool>,
@@ -241,10 +187,10 @@ impl EncryptionAlgorithm {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Header {
+pub struct Header {
     version: u32,
     salt: [u8; 32],
-    algorithm: EncryptionAlgorithm,
+    pub algorithm: EncryptionAlgorithm,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -777,7 +723,7 @@ pub fn encrypt_folder(folder_path: &Path, output_path: &Path, password: &str, al
     Ok(())
 }
 
-pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, shutdown: LazyShutdown) -> Result<()> {
+pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str, shutdown: LazyShutdown) -> Result<Header> {
     info!("Starting decryption of {} to {}", encrypted_path.display(), output_path.display());
     
     // Open encrypted file
@@ -804,10 +750,6 @@ pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str,
     };
 
     debug!("Decrypting with algorithm: {}", header.algorithm.to_string());
-
-    // SETTING GLOBAL RUNTIME CTX
-    RUNTIME_CTX.set_version(header.version);
-    RUNTIME_CTX.set_algorithm(header.algorithm);
     
     // Create channels for streaming
     let (encrypted_sender, encrypted_receiver) = channel::bounded(10);
@@ -845,7 +787,7 @@ pub fn decrypt_folder(encrypted_path: &Path, output_path: &Path, password: &str,
     }
 
     info!("Decryption completed successfully");
-    Ok(())
+    Ok(header)
 }
 
 /// Adds a directory and its contents to a tar archive, maintaining relative paths

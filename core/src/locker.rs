@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread;
 use std::io;
-use log::{info, error, debug};
+use log::{debug, error, info, warn};
 use fuser::{FileAttr, Filesystem, MountOption};
 use whoami;
 use anyhow::{Context, Result, anyhow};
-use crate::core::{decrypt_folder, encrypt_folder, EncryptionAlgorithm, LazyShutdown, CTRL_C, RUNTIME_CTX};
+use crate::core::{decrypt_folder, encrypt_folder, EncryptionAlgorithm, LazyShutdown, CTRL_C};
 use crate::fusefs::{Inode, MemFile, MemFilesystem};
 
 /// Creates a new blank encrypted locker at the specified path
@@ -66,35 +66,21 @@ pub fn new(output_path: &Path, fs_path: &Path, password: String, algorithm: Encr
         .context("Failed to create FUSE session")?;
     let mut unmount = session.unmount_callable();
 
-    // Use re-mounted filesystem for re-encryption
-    let fs_path_clone = fs_path.to_path_buf();
-    let output_path_clone = output_path.to_path_buf();
-    let password_clone = password.clone();
-    let algorithm_clone = algorithm.clone();
-    std::thread::spawn(move || {
-        wait_for_mount(&fs_path_clone).unwrap();
-        encrypt_folder(&fs_path_clone, &output_path_clone, &password_clone, algorithm_clone, CTRL_C.get_shutdown()).unwrap();
+    let t = session.spawn();
 
-        match unmount.unmount() {
-            Ok(_) => {
-                info!("Unmounted filesystem at {}", fs_path_clone.display());
-            }
-            Err(e) => {
-                error!("Failed to unmount filesystem at {}: {}", fs_path_clone.display(), e);
-            }
-        }
-    });
+    wait_for_mount(&fs_path).unwrap();
+    encrypt_folder(&fs_path, &output_path, &password, algorithm, CTRL_C.get_shutdown()).unwrap();
 
-    // Run the session
-    match session.run() {
+    match unmount.unmount() {
         Ok(_) => {
-            info!("Session run successfully");
+            info!("Unmounted filesystem at {}", fs_path.display());
         }
         Err(e) => {
-            error!("Session run failed: {}", e);
-            return Err(anyhow!("Session run failed: {}", e));
+            error!("Failed to unmount filesystem at {}: {}", fs_path.display(), e);
         }
     }
+
+    t.unwrap().join();
 
     // Clean up the mount point
     try_cleanup_mount(&fs_path);
@@ -155,56 +141,42 @@ pub fn open(encrypted_path: &Path, fs_path: &Path, password: String) -> Result<(
     let decrypt_thread = std::thread::spawn(move || {
         match wait_for_mount(&fs_path_clone) {
             Ok(()) => {
-                if let Err(e) = decrypt_folder(&encrypted_path_clone, &fs_path_clone, &password_clone, shutdown_clone) {
-                    error!("Decrypt thread failed to mount and decrypt: {}", e);
-                }
+                decrypt_folder(&encrypted_path_clone, &fs_path_clone, &password_clone, shutdown_clone)
             }
             Err(e) => {
-                error!("Decrypt thread failed to mount and decrypt: {}", e);
+                error!("Failed to mount and decrypt: {}", e);
+                Err(anyhow!("Failed to mount and decrypt: {}", e))
             }
         }
     });
 
     // Mount the filesystem
     let fs = mount_and_recover_filesystem(fs_path)?;
-    decrypt_thread.join().unwrap();
+    let header = decrypt_thread.join()
+        .map_err(|e| anyhow!("Decrypt thread panicked: {:?}", e))?
+        .map_err(|e| anyhow!("Decrypt operation failed: {}", e))?;
 
     // Re-mount the filesystem
     let mut session = fuser::Session::new(fs, &fs_path, &[MountOption::RW, MountOption::FSName(fs_path.file_name().unwrap().to_string_lossy().to_string())])
         .context("Failed to create FUSE session")?;
     let mut unmount = session.unmount_callable();
 
-    // Use re-mounted filesystem for re-encryption
-    let fs_path_clone = fs_path.to_path_buf();
-    let tmp_encrypted_path_clone = tmp_encrypted_path.to_path_buf();
-    let password_clone = password.clone();
-    let algorithm_clone = RUNTIME_CTX.get_algorithm().clone();
+    let t = session.spawn();
 
     info!("Re-encrypting locker at {}", encrypted_path.display());
-    std::thread::spawn(move || {
-        wait_for_mount(&fs_path_clone).unwrap();
-        encrypt_folder(&fs_path_clone, &tmp_encrypted_path_clone, &password_clone, algorithm_clone, CTRL_C.get_shutdown()).unwrap();
+    wait_for_mount(&fs_path).unwrap();
+    encrypt_folder(&fs_path, &tmp_encrypted_path, &password, header.algorithm, CTRL_C.get_shutdown()).unwrap();
 
-        match unmount.unmount() {
-            Ok(_) => {
-                info!("Unmounted filesystem at {}", fs_path_clone.display());
-            }
-            Err(e) => {
-                error!("Failed to unmount filesystem at {}: {}", fs_path_clone.display(), e);
-            }
-        }
-    });
-
-    // Run the session
-    match session.run() {
+    match unmount.unmount() {
         Ok(_) => {
-            info!("Session run successfully");
+            info!("Unmounted filesystem at {}", fs_path.display());
         }
         Err(e) => {
-            error!("Session run failed: {}", e);
-            return Err(anyhow!("Session run failed: {}", e));
+            error!("Failed to unmount filesystem at {}: {}", fs_path.display(), e);
         }
     }
+
+    t.unwrap().join();
 
     // Rename temporary .part file to encrypted file
     fs::rename(tmp_encrypted_path, encrypted_path)?;
@@ -249,9 +221,6 @@ pub fn open(encrypted_path: &Path, fs_path: &Path, password: String) -> Result<(
 /// ```
 pub fn encrypt(folder_path: &Path, output_path: &Path, password: String, algorithm: EncryptionAlgorithm) -> Result<()> {
     info!("Encrypting folder {} to {}", folder_path.display(), output_path.display());
-    
-    // Create output file
-    debug!("Created output file: {}", output_path.display());
 
     // Write Locker ID
     debug!("Wrote Locker ID");
@@ -294,114 +263,6 @@ fn mount_and_recover_filesystem(fs_path: &Path) -> Result<MemFilesystem> {
     fs.next_inode = next_inode;
 
     return Ok(fs);
-}
-
-/// Mounts and decrypts an encrypted locker file
-fn mount_and_decrypt(encrypted_path: &Path, fs_path: &Path, password: &String, mut fs: crate::fusefs::MemFilesystem, shutdown: LazyShutdown) -> Result<()> {
-    let encrypted_path_clone = encrypted_path.to_path_buf();
-    let password_clone = password.clone();
-    let shutdown_clone = shutdown.clone();
-    let fs_path_clone = fs_path.to_path_buf();
-    let decrypt_thread = std::thread::spawn(move || {
-        match wait_for_mount(&fs_path_clone) {
-            Ok(()) => {
-                let _ = decrypt_folder(&encrypted_path_clone, &fs_path_clone, &password_clone, shutdown_clone);
-            }
-            Err(e) => {
-                error!("Failed to mount and decrypt: {}", e);
-            }
-        }
-    });
-
-    fuser::mount2(fs, fs_path, &[MountOption::RW, MountOption::FSName(fs_path.file_name().unwrap().to_string_lossy().to_string())])
-        .context("Failed to mount filesystem")?;
-    decrypt_thread.join().unwrap();
-
-    info!("Mount and decrypt completed successfully");
-    Ok(())
-}
-
-/// Unmounts and re-encrypts a locker file
-fn unmount_and_encrypt(encrypted_path: &Path, fs_path: &Path, password: &String, algorithm: EncryptionAlgorithm, shutdown: LazyShutdown) -> std::io::Result<()> {
-    let temp_encrypted_path = encrypted_path.with_extension("part");
-
-    info!("Encrypting contents to temporary file {}...", temp_encrypted_path.display());
-    
-    // Encrypt the contents to the temporary file using AES-GCM-SIV
-    if let Err(e) = encrypt_folder(fs_path, &temp_encrypted_path, password, algorithm, shutdown) {
-        error!("Failed to encrypt folder: {}", e);
-        std::fs::remove_file(temp_encrypted_path)?; // remove temp file if encryption fails
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-    }
-
-    info!("Replacing original encrypted file...");
-    
-    // Remove the original file and rename the temporary file
-    std::fs::remove_file(encrypted_path)?;
-    std::fs::rename(&temp_encrypted_path, encrypted_path)?;
-
-    try_cleanup_mount(fs_path);
-
-    info!("Unmount and re-encryption completed successfully");
-    Ok(())
-}
-
-/// Converts a path to be relative to the current directory
-/// 
-/// # Arguments
-/// * `path` - The path to convert to a relative path
-/// 
-/// # Returns
-/// * `Ok(PathBuf)` containing the relative path if successful
-/// * `Err(io::Error)` if the path cannot be converted to a relative path
-/// 
-/// # Example
-/// ```
-/// use std::path::Path;
-/// 
-/// let absolute_path = Path::new("/home/user/documents/file.txt");
-/// let relative_path = get_relative_path(absolute_path).unwrap();
-/// ```
-fn get_relative_path(path: &Path) -> io::Result<PathBuf> {
-    // If path is already relative, return it as is
-    if !path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-
-    let current_dir = std::env::current_dir()?;
-    
-    // Get the components of both paths
-    let mut path_components = path.components();
-    let mut current_components = current_dir.components();
-    
-    // Skip common prefix
-    while let (Some(p), Some(c)) = (path_components.next(), current_components.next()) {
-        if p != c {
-            // Found a difference, need to rebuild the path
-            let mut result = PathBuf::new();
-            
-            // Add ".." for each remaining component in current_dir
-            for _ in current_components {
-                result.push("..");
-            }
-            
-            // Add the remaining components from the input path
-            result.push(p);
-            for component in path_components {
-                result.push(component);
-            }
-            
-            return Ok(result);
-        }
-    }
-    
-    // If we get here, the path is a subpath of current_dir
-    let mut result = PathBuf::new();
-    for component in path_components {
-        result.push(component);
-    }
-    
-    Ok(result)
 }
 
 fn create_mount_point(fs_path: &Path) -> Result<()> {
@@ -483,7 +344,7 @@ pub fn try_cleanup_mount(fs_path: &Path) {
             info!("Unmounted filesystem at {}...", &fs_path.display());
         }
         Err(e) => {
-            error!("Failed to unmount filesystem at {}: {}", &fs_path.display(), e);
+            warn!("Failed to unmount filesystem at {}: {}", &fs_path.display(), e);
         }
     }
 
@@ -498,7 +359,7 @@ pub fn try_cleanup_mount(fs_path: &Path) {
             info!("Cleaned filesystem at {}...", &fs_path.display());
         }
         Err(e) => {
-            error!("Failed to clean filesystem at {}: {}", &fs_path.display(), e);
+            warn!("Failed to clean filesystem at {}: {}", &fs_path.display(), e);
         }
     }
 } 
