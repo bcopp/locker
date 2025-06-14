@@ -1,5 +1,9 @@
 # Locker
 
+<div align="center">
+  <img src="assets/locker-logo.png" alt="Locker Logo" width="200"/>
+</div>
+
 A secure file encryption and virtual filesystem tool that allows you to create encrypted containers that can be mounted as virtual drives.
 
 ## Features
@@ -107,14 +111,6 @@ git clone https://github.com/yourusername/locker.git
 cd locker
 cargo build --release
 ```
-
-## Roadmap
-
-[X] - Core Library
-[X] - CLI Interface
-[] - GUI
-[X] - Linux Support
-[] - MacOS Support
 
 ## License
 
