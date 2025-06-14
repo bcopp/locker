@@ -108,7 +108,7 @@ The locker file format consists of the following sections:
 
 ```bash
 git clone https://github.com/yourusername/locker.git
-cd locker
+cd locker/cli
 cargo build --release
 ```
 
