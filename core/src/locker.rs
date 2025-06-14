@@ -14,7 +14,7 @@ use log::{debug, error, info, warn};
 use fuser::{FileAttr, Filesystem, MountOption};
 use whoami;
 use anyhow::{Context, Result, anyhow};
-use crate::core::{decrypt_folder, encrypt_folder, EncryptionAlgorithm, LazyShutdown, CTRL_C};
+use crate::core::{decrypt_folder, encrypt_folder, EncryptionAlgorithm, LazyShutdown};
 use crate::fusefs::{Inode, MemFile, MemFilesystem};
 
 /// Creates a new blank encrypted locker at the specified path
@@ -52,7 +52,7 @@ use crate::fusefs::{Inode, MemFile, MemFilesystem};
 /// }
 /// ```
 
-pub fn new(output_path: &Path, fs_path: &Path, password: String, algorithm: EncryptionAlgorithm) -> Result<()> {
+pub fn new(output_path: &Path, fs_path: &Path, password: String, algorithm: EncryptionAlgorithm, shutdown: LazyShutdown) -> Result<()> {
     info!("Creating new locker at mount point {}", fs_path.display());
 
     // Create empty mount point
@@ -69,7 +69,7 @@ pub fn new(output_path: &Path, fs_path: &Path, password: String, algorithm: Encr
     let t = session.spawn();
 
     wait_for_mount(&fs_path).unwrap();
-    encrypt_folder(&fs_path, &output_path, &password, algorithm, CTRL_C.get_shutdown()).unwrap();
+    encrypt_folder(&fs_path, &output_path, &password, algorithm, shutdown.clone()).unwrap();
 
     match unmount.unmount() {
         Ok(_) => {
@@ -122,7 +122,7 @@ pub fn new(output_path: &Path, fs_path: &Path, password: String, algorithm: Encr
 ///     Err(e) => eprintln!("Failed to handle locker: {}", e),
 /// }
 /// ```
-pub fn open(encrypted_path: &Path, fs_path: &Path, password: String) -> Result<()> {
+pub fn open(encrypted_path: &Path, fs_path: &Path, password: String, shutdown: LazyShutdown) -> Result<()> {
     info!("Opening locker at {} with mount point {}", encrypted_path.display(), fs_path.display());
 
     let tmp_encrypted_path= encrypted_path.with_extension("part");
@@ -136,7 +136,7 @@ pub fn open(encrypted_path: &Path, fs_path: &Path, password: String) -> Result<(
     // Setup the thread to decrypt the filesystem
     let encrypted_path_clone = encrypted_path.to_path_buf();
     let password_clone = password.clone();
-    let shutdown_clone = CTRL_C.get_shutdown().clone();
+    let shutdown_clone = shutdown.clone();
     let fs_path_clone = fs_path.to_path_buf();
     let decrypt_thread = std::thread::spawn(move || {
         match wait_for_mount(&fs_path_clone) {
@@ -165,7 +165,7 @@ pub fn open(encrypted_path: &Path, fs_path: &Path, password: String) -> Result<(
 
     info!("Re-encrypting locker at {}", encrypted_path.display());
     wait_for_mount(&fs_path).unwrap();
-    encrypt_folder(&fs_path, &tmp_encrypted_path, &password, header.algorithm, CTRL_C.get_shutdown()).unwrap();
+    encrypt_folder(&fs_path, &tmp_encrypted_path, &password, header.algorithm, shutdown.clone()).unwrap();
 
     match unmount.unmount() {
         Ok(_) => {
@@ -219,7 +219,7 @@ pub fn open(encrypted_path: &Path, fs_path: &Path, password: String) -> Result<(
 ///     Err(e) => eprintln!("Failed to encrypt folder: {}", e),
 /// }
 /// ```
-pub fn encrypt(folder_path: &Path, output_path: &Path, password: String, algorithm: EncryptionAlgorithm) -> Result<()> {
+pub fn encrypt(folder_path: &Path, output_path: &Path, password: String, algorithm: EncryptionAlgorithm, shutdown: LazyShutdown) -> Result<()> {
     info!("Encrypting folder {} to {}", folder_path.display(), output_path.display());
 
     // Write Locker ID
@@ -229,7 +229,7 @@ pub fn encrypt(folder_path: &Path, output_path: &Path, password: String, algorit
         &output_path,
         &password,
         algorithm,
-        CTRL_C.get_shutdown()
+        shutdown,
     )?;
     
     Ok(())

@@ -6,7 +6,7 @@ use std::thread;
 use crossbeam::channel::{self, Sender, Receiver};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
-    ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce
+    ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNone
 };
 use aes_gcm_siv::{
     aead::{Aead as AesAead, KeyInit as AesKeyInit},
@@ -26,7 +26,6 @@ use num_cpus;
 use std::process::Command;
 use fuser::{MountOption, Filesystem};
 use std::sync::LazyLock;
-use ctrlc;
 use whoami;
 use anyhow::{Context, Result, anyhow};
 
@@ -112,56 +111,6 @@ impl Clone for LazyShutdown {
     }
 }
 
-pub struct CtrlC {
-    shutdown: LazyShutdown,
-    fs_path: Arc<Mutex<Option<PathBuf>>>,
-}
-
-impl CtrlC {
-    fn new() -> Self {
-        Self {
-            shutdown: LazyShutdown::new(),
-            fs_path: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn set_fs_path(&self, fs_path: PathBuf) {
-        if let Ok(mut self_fs_path) = self.fs_path.lock() {
-            *self_fs_path = Some(fs_path);
-        }
-    }
-
-    pub fn get_shutdown(&self) -> LazyShutdown {
-        self.shutdown.clone()
-    }
-
-    pub fn handle_ctrlc(&self) {
-        if let Ok(fs_path) = self.fs_path.lock() {
-            if let Some(path) = fs_path.as_ref() {
-                let _ = try_cleanup_mount(path);
-            }
-        }
-        self.shutdown.request_shutdown("Received Ctrl+C signal");
-    }
-}
-
-pub static CTRL_C: LazyLock<CtrlC> = LazyLock::new(|| {
-    let ctrlc = CtrlC::new();
-    let ctrlc_clone = ctrlc.clone();
-    ctrlc::set_handler(move || {
-        ctrlc_clone.handle_ctrlc();
-    }).expect("Error setting Ctrl-C handler");
-    ctrlc
-});
-
-impl Clone for CtrlC {
-    fn clone(&self) -> Self {
-        Self {
-            shutdown: self.shutdown.clone(),
-            fs_path: Arc::clone(&self.fs_path),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncryptionAlgorithm {
@@ -220,7 +169,7 @@ impl StreamEncrypter {
         
         let encrypted_data = if self.algorithm == EncryptionAlgorithm::ChaCha20Poly1305 {
             let cipher = ChaCha20Poly1305::new(ChaChaKey::from_slice(&self.key));
-            let nonce = ChaChaNonce::from(nonce_bytes);
+            let nonce = ChaChaNone::from(nonce_bytes);
             cipher.encrypt(&nonce, data)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ChaCha encryption error: {:?}", e)))?
         } else {
@@ -255,7 +204,7 @@ impl StreamDecrypter {
     fn decrypt(&self, chunk: &EncryptedChunk) -> io::Result<Vec<u8>> {
         if self.algorithm == EncryptionAlgorithm::ChaCha20Poly1305 {
             let cipher = ChaCha20Poly1305::new(ChaChaKey::from_slice(&self.key));
-            let nonce = ChaChaNonce::from(chunk.nonce);
+            let nonce = ChaChaNone::from(chunk.nonce);
             cipher.decrypt(&nonce, chunk.data.as_ref())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ChaCha decryption error: {:?}", e)))
         } else {
