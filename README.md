@@ -26,7 +26,7 @@ cargo install --path .
 ### Creating a New Locker
 
 ```bash
-locker new /path/to/locker.encrypted /media/my-locker "your-password" [--algorithm chacha20poly1305|aes256-gcm-siv]
+locker new /path/to/locker.encrypted /media/my-locker  [--algorithm chacha20poly1305|aes256-gcm-siv]
 ```
 
 This command will:
@@ -38,7 +38,7 @@ This command will:
 ### Opening a Locker
 
 ```bash
-locker open /path/to/locker.encrypted /media/my-locker "your-password"
+locker open /path/to/locker.encrypted /media/my-locker 
 ```
 
 This command will:
@@ -50,7 +50,7 @@ This command will:
 ### Encrypting an Existing Folder
 
 ```bash
-locker encrypt /path/to/folder /path/to/output.encrypted "your-password" [--algorithm chacha20poly1305|aes256-gcm-siv]
+locker encrypt /path/to/folder /path/to/output.encrypted  [--algorithm chacha20poly1305|aes256-gcm-siv]
 ```
 
 This command will:
