@@ -111,7 +111,3 @@ git clone https://github.com/yourusername/locker.git
 cd locker/cli
 cargo build --release
 ```
-
-## License
-
-MIT
