@@ -1,8 +1,8 @@
-# Locker
-
 <div align="center">
   <img src="./logo.png" alt="Locker Logo" width="200"/>
 </div>
+
+# Locker
 
 A secure file encryption and virtual filesystem tool that allows you to create encrypted containers that can be mounted as virtual drives.
 
